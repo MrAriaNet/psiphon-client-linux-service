@@ -16,7 +16,7 @@ System-wide VPN service for Linux with absolute kill-switch protection. Zero-tru
 - **Zero Trust Security**
   - Default deny-all policy
   - DNS leak prevention
-  - Dedicated non-root user isolation
+  - Dedicated **non-root user isolation**
 
 ## 📋 Requirements
 
