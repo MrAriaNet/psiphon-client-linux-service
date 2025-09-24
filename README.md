@@ -2,6 +2,8 @@
 
 System-wide VPN service for Linux with absolute kill-switch protection. Zero-trust networking model: all traffic must go through VPN or is blocked.
 
+[![Codacy Security Scan](https://github.com/boilingoden/psiphon-client-linux-service/actions/workflows/codacy.yml/badge.svg)](https://github.com/boilingoden/psiphon-client-linux-service/actions/workflows/codacy.yml)
+
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](http://unlicense.org/)
 
 ## 🛡️ Key Features
@@ -18,7 +20,7 @@ System-wide VPN service for Linux with absolute kill-switch protection. Zero-tru
 
 ## 📋 Requirements
 
-- Linux with systemd
+- Linux with systemd (only if you want to use it)
 - Root access
 - iptables/ip6tables
 
