@@ -36,7 +36,8 @@ readonly LOCK_FILE="/run/psiphon-tun.lock"
 readonly PID_FILE="/run/psiphon-tun.pid"
 readonly GITHUB_API="https://api.github.com/repos/Psiphon-Labs/psiphon-tunnel-core-binaries"
 readonly PSIPHON_BINARY_URL="https://github.com/Psiphon-Labs/psiphon-tunnel-core-binaries/raw/master/linux/psiphon-tunnel-core-x86_64"
-readonly SERVICE_NAME="psiphon-tun"
+readonly SERVICE_CONFIGURE_NAME="psiphon-tun"
+readonly SERVICE_BINARY_NAME="psiphon-binary"
 # Network Security Configuration
 readonly TUN_INTERFACE="PsiphonTUN"      # Dedicated TUN interface for isolated traffic
 readonly TUN_SUBNET="10.200.3.0/24"      # IPv4 subnet for tunnel traffic isolation
@@ -386,7 +387,7 @@ SERVICE_SCRIPT="$INSTALL_DIR/psiphon-tun.sh"
 
 case "\${1:-}" in
     start)
-        "\$SERVICE_SCRIPT" systemd_start 
+        "\$SERVICE_SCRIPT" systemd_start
         ;;
     stop)
         "\$SERVICE_SCRIPT" systemd_stop
@@ -407,27 +408,24 @@ EOF
     chmod 755 "$service_script"
     chown root:root "$service_script"
 
-    # Create systemd service file
-    tee /etc/systemd/system/$SERVICE_NAME.service >/dev/null <<EOF
+    # Create main systemd service file
+    tee /etc/systemd/system/$SERVICE_CONFIGURE_NAME.service >/dev/null <<EOF
 [Unit]
-Description=Psiphon TUN Service
+Description=Psiphon TUN Service (Network Configuration)
 After=network-online.target
 Wants=network-online.target
-Documentation=https://github.com/Psiphon-Labs/psiphon-tunnel-core
+Before=$SERVICE_BINARY_NAME.service
+Documentation=https://github.com/boilingoden/psiphon-client-linux-service
 
 [Service]
 Type=simple
+RemainAfterExit=yes
 ExecStart=$service_script start
 ExecStop=$service_script stop
 ExecReload=$service_script reload
-PIDFile=$LOCK_FILE
-# Restart=on-failure
-# RestartSec=30
-TimeoutStartSec=120
-TimeoutStopSec=30
+# TimeoutStartSec=120
+# TimeoutStopSec=30
 User=root
-KillMode=mixed
-KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal
 
@@ -439,8 +437,45 @@ ProtectHome=true
 ReadWritePaths=$INSTALL_DIR /run /var/log /etc/resolv.conf /etc/systemd/resolved.conf.d
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_IPC_LOCK
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_IPC_LOCK
-SecureBits=keep-caps
-LimitNOFILE=infinity
+SecureBits=keep-caps-locked
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Create tunnel service file
+    tee /etc/systemd/system/$SERVICE_BINARY_NAME.service >/dev/null <<EOF
+[Unit]
+Description=Psiphon Binary Process
+After=network-online.target $SERVICE_CONFIGURE_NAME.service
+Requires=$SERVICE_CONFIGURE_NAME.service
+Documentation=https://github.com/boilingoden/psiphon-client-linux-service
+StartLimitIntervalSec=10
+StartLimitBurst=3
+
+[Service]
+Type=exec
+# ExecStartPre=/bin/sleep 2
+ExecStart=$PSIPHON_BINARY -config $PSIPHON_CONFIG_FILE -dataRootDirectory $INSTALL_DIR/data \\
+    -tunDevice $TUN_INTERFACE -tunBindInterface $TUN_BYPASS_INTERFACE \\
+    -tunDNSServers $TUN_DNS_SERVERS,$TUN_DNS_SERVERS6 -formatNotices -useNoticeFiles
+# ExecStop=/bin/kill -TERM \$MAINPID
+# ExecReload=/bin/systemctl --no-block restart %n
+User=$PSIPHON_USER
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=5s
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=$INSTALL_DIR
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+SecureBits=noroot-locked
 
 [Install]
 WantedBy=multi-user.target
@@ -652,7 +687,8 @@ function setup_routing() {
     # iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT
     # iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT
 
-    # Allow traffic for the psiphon user to establish the tunnel.
+    # Allow traffic for the psiphon user to establish the tunnel
+    # and ensure it can access network resources
     iptables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
 
     # Allow all traffic going through the TUN interface.
@@ -725,7 +761,8 @@ function setup_ipv6_routing() {
     # # Allow link-local addresses for local network discovery.
     # ip6tables -A OUTPUT -d fe80::/10 -j ACCEPT
 
-    # Allow traffic for the psiphon user to establish the tunnel.
+    # Allow traffic for the psiphon user to establish the tunnel
+    # and ensure it can access network resources
     ip6tables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
 
     # Allow all traffic going through the TUN interface.
@@ -750,37 +787,13 @@ function setup_ipv6_routing() {
     success "IPv6 routing configured"
 }
 
-# Reload Psiphon
-function psiphon_reload() {
-    log "Reloading Psiphon with native TUN support..."
-
-    # Kill any existing Psiphon processes
-    if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
-        log "$(exec pkill -nf "psiphon-tunnel-core" 2>/dev/null || true)"
-    fi
-
-    sleep 2
-
-    exec runuser -u "$PSIPHON_USER" -- "$PSIPHON_BINARY" \
-            -config "$PSIPHON_CONFIG_FILE" \
-            -dataRootDirectory "$INSTALL_DIR/data" \
-            -tunDevice "$TUN_INTERFACE" \
-            -tunBindInterface "$TUN_BYPASS_INTERFACE" \
-            -tunDNSServers "$TUN_DNS_SERVERS,$TUN_DNS_SERVERS6" \
-            -formatNotices \
-            -useNoticeFiles
-
-    warning "Psiphon exited unexpectedly in service mode"
-    warning "There is still a chance it may fail due to systemd service reload."
-
-    # Reload binary to attempt recovery
-    # TODO: check if it will cause a loop on failure or stop
-    if [[ "$SERVICE_RELOAD" == "true" ]]; then
-        # We don't need to set SERVICE_RELOAD="false"
-        # because the script runs fresh each time
-        psiphon_reload
-    fi
+# systemd service psiphon binary restart helper
+function systemd_psiphon_reload() {
+    log "Reloading Psiphon binary service..."
+    systemctl --no-block restart "$SERVICE_BINARY_NAME.service"
+    success "Psiphon binary service reload command issued."
 }
+
 
 # Secure Service Initialization
 # Starts Psiphon with security-first approach:
@@ -812,29 +825,11 @@ function start_psiphon() {
     pkill -f "psiphon-tunnel-core.*$TUN_INTERFACE" 2>/dev/null || true
     sleep 2
 
-    # In service mode, run directly without backgrounding
+    # In service mode, run as a systemd service
     if [[ "$SERVICE_MODE" == "true" ]]; then
-        exec runuser -u "$PSIPHON_USER" -- "$PSIPHON_BINARY" \
-            -config "$PSIPHON_CONFIG_FILE" \
-            -dataRootDirectory "$INSTALL_DIR/data" \
-            -tunDevice "$TUN_INTERFACE" \
-            -tunBindInterface "$TUN_BYPASS_INTERFACE" \
-            -tunDNSServers "$TUN_DNS_SERVERS,$TUN_DNS_SERVERS6" \
-            -formatNotices \
-            -useNoticeFiles
-        
-        warning "Psiphon exited unexpectedly in service mode"
-        warning "Check logs with: journalctl -u $SERVICE_NAME.service -f"
-        warning "Or check log file: $LOG_FILE"
-        warning "If Psiphon fails to start, try running script manually with:"
-        warning "sudo $INSTALL_DIR/psiphon-tun.sh start"
-        warning "There is still a chance it may fail due to systemd service reload."
-
-        # reload binary to attempt recovery
-        # TODO: check if it will cause a loop on failure or stop
-        # TODO: these parts should be using trap functionality instead
-        
-        psiphon_reload
+        systemctl start $SERVICE_BINARY_NAME.service
+        log "Run: systemctl status $SERVICE_BINARY_NAME.service"
+        log "   to check the status of the Psiphon binary service."
     else
         # For manual mode, keep the background process
         
@@ -923,7 +918,16 @@ function cleanup_routing() {
 function stop_services() {
     log "Stopping services..."
 
-    local stopped_something=false
+    if [[ "$SERVICE_MODE" == "true" ]]; then
+        systemctl stop $SERVICE_BINARY_NAME.service
+        # Check if still running
+        if systemctl is-active --quiet $SERVICE_BINARY_NAME.service 2>/dev/null; then
+            warning "Psiphon binary service did not stop cleanly, attempting to kill process..."
+        else
+            log "Psiphon binary service stopped."
+            stopped_something=true
+        fi
+    fi
 
     # Stop Psiphon
     if [[ -f $PID_FILE ]]; then
@@ -992,8 +996,8 @@ function install_shell() {
 
     success "Psiphon TUN setup installed successfully"
     log "Use '$0 start' to start the service"
-    log "Use 'sudo systemctl enable $SERVICE_NAME' to start automatically at boot"
-    log "Use 'sudo systemctl start $SERVICE_NAME' to start via systemd"
+    log "Use 'sudo systemctl enable $SERVICE_CONFIGURE_NAME' to start automatically at boot"
+    log "Use 'sudo systemctl start $SERVICE_CONFIGURE_NAME' to start via systemd"
 }
 
 # Uninstall everything
@@ -1001,15 +1005,15 @@ function uninstall() {
     log "Uninstalling Psiphon TUN setup..."
 
     # Stop services first
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    if systemctl is-active --quiet "$SERVICE_CONFIGURE_NAME" 2>/dev/null; then
+        systemctl stop "$SERVICE_CONFIGURE_NAME" 2>/dev/null || true
     fi
 
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-        systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    if systemctl is-enabled --quiet "$SERVICE_CONFIGURE_NAME" 2>/dev/null; then
+        systemctl disable "$SERVICE_CONFIGURE_NAME" 2>/dev/null || true
     fi
 
-    rm -f /etc/systemd/system/$SERVICE_NAME.service
+    rm -f /etc/systemd/system/$SERVICE_CONFIGURE_NAME.service
     systemctl daemon-reload 2>/dev/null || true
 
     stop_services
@@ -1210,7 +1214,7 @@ FILES:
     • Binary: $PSIPHON_BINARY
     • Psiphon Config: $PSIPHON_CONFIG_FILE
     • Logs: $LOG_FILE $(du -h "$LOG_FILE" | cut -f1)
-    • Service: /etc/systemd/system/$SERVICE_NAME.service
+    • Service: /etc/systemd/system/$SERVICE_CONFIGURE_NAME.service
     • Psiphon notices: $INSTALL_DIR/data/notices
 
 EXAMPLES:
@@ -1219,12 +1223,12 @@ EXAMPLES:
     $0 status           # Check service status
 
     # Systemd management:
-    sudo systemctl enable $SERVICE_NAME    # Auto-start at boot
-    sudo systemctl start $SERVICE_NAME     # Start via systemd
-    sudo systemctl status $SERVICE_NAME    # Check systemd status
+    sudo systemctl enable $SERVICE_CONFIGURE_NAME    # Auto-start at boot
+    sudo systemctl start $SERVICE_CONFIGURE_NAME     # Start via systemd
+    sudo systemctl status $SERVICE_CONFIGURE_NAME    # Check systemd status
 
-For more information, visit: https://github.com/Psiphon-Labs/psiphon-tunnel-core
-Script Source: https://github.com/boilingoden/psiphon-client-linux-service
+For more information, visit: https://github.com/boilingoden/psiphon-client-linux-service
+And: https://github.com/Psiphon-Labs/psiphon-tunnel-core
 
 EOF
 }
@@ -1260,15 +1264,13 @@ function main() {
             start_services
             ;;
         reload)
-            SERVICE_RELOAD="true"
             check_root
-            psiphon_reload # ask psiphon to reload itself 
+            start_psiphon # it will first kill then start psiphon 
             ;;
         systemd_reload)
             SERVICE_MODE="true"
-            SERVICE_RELOAD="true"
             check_root
-            psiphon_reload
+            systemd_psiphon_reload
             ;;
         stop)
             check_root
