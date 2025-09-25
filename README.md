@@ -1,10 +1,8 @@
 # Psiphon Linux VPN Service
 
-System-wide VPN service for Linux with absolute kill-switch protection. Zero-trust networking model: all traffic must go through VPN or is blocked.
+System-wide Psiphon VPN service for Linux with absolute kill-switch protection. Zero-trust networking model: all traffic must go through VPN or is blocked; non-root user isolation for Psiphon binary.
 
 [![Codacy Security Scan](https://github.com/boilingoden/psiphon-client-linux-service/actions/workflows/codacy.yml/badge.svg)](https://github.com/boilingoden/psiphon-client-linux-service/actions/workflows/codacy.yml)
-
-[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](http://unlicense.org/)
 
 ## 🛡️ Key Features
 
@@ -46,6 +44,12 @@ sudo systemctl stop psiphon-tun
 
 # Check status
 sudo systemctl status psiphon-tun
+
+# Keep kill-switch on and restart only the Psiphon binary
+sudo systemctl reload psiphon-tun
+
+# Restart without keeping kill-switch
+sudo systemctl Restart psiphon-tun
 ```
 
 Configuration: `/opt/psiphon-tun/psiphon/psiphon.config`
@@ -59,8 +63,12 @@ Configuration: `/opt/psiphon-tun/psiphon/psiphon.config`
 ## 🐛 Troubleshooting
 
 ```bash
-# View logs
+# View logs (script mode)
 sudo tail -f /opt/psiphon-tun/psiphon-tun.log
+
+# View logs (systemd service mode)
+sudo systemctl status psiphon-tun.service
+sudo systemctl status psiphon-binary.service
 
 # Test connection
 sudo ./Psiphon-Linux-VPN-Service-Setup.sh status
