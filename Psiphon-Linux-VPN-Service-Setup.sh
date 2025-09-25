@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.0.0"
+readonly INSTALLER_VERSION="1.0.1"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -1176,7 +1176,7 @@ function usage() {
                                               ― George Orwell, 1984
 
 
-Psiphon TUN Setup Script - Secure Tunneling Solution
+Psiphon TUN Setup Script - Secure Tunneling Solution v$INSTALLER_VERSION
 
 Usage: $0 [COMMAND]
 
