@@ -107,11 +107,21 @@ start_services     # Start with latest binary
    - TUN interface: `PsiphonTUN`
    - Default subnets: `10.200.3.0/24` (IPv4), `fd42:42:42::/64` (IPv6)
    - DNS: Google/Cloudflare DNS with both IPv4/IPv6 support
+   - Automatic bypass interface detection for startup
 
 2. **System Services**
    - Systemd service integration
    - DNS resolution through systemd-resolved when available
    - iptables/ip6tables for routing and firewalls
+   - Root/sudo required for all commands
+   - Environment variables for easy configuration:
+     ```bash
+     PSIPHON_USER="psiphon-user"     # Dedicated non-root user
+     SOCKS_PORT=1081                 # Local SOCKS proxy port
+     HTTP_PORT=8081                  # Local HTTP proxy port
+     INSTALL_DIR="/opt/psiphon-tun"  # Base installation directory
+     TUN_INTERFACE="PsiphonTUN"      # TUN device name
+     ```
 
 ## Common Tasks
 
@@ -124,6 +134,10 @@ start_services     # Start with latest binary
    - Check service logs: `tail -f /opt/psiphon-tun/psiphon-tun.log`
    - Verify network stack: `ip addr show PsiphonTUN`
    - Test connectivity: `curl --interface PsiphonTUN ifconfig.me`
+   - Common issues:
+     * DNS leaks: Check `/etc/resolv.conf` and systemd-resolved status
+     * Connection drops: Verify kill switch in `iptables -L OUTPUT`
+     * Route conflicts: Check `ip route show table all`
 
 3. **Testing Changes**
    - Use `stop_services` before major network changes
@@ -131,6 +145,13 @@ start_services     # Start with latest binary
    - Test DNS resolution through the tunnel
    - Check binary updates: `check_and_update_psiphon` function
    - Verify version info with `get_binary_version_info`
+   - Test connection status:
+     ```bash
+     # Full connection test with IPv4/IPv6 and DNS
+     sudo ./Psiphon-Linux-VPN-Service-Setup.sh status
+     # Detailed service status
+     systemctl status psiphon-tun.service
+     ```
 
 ## Critical Security Guidelines
 
