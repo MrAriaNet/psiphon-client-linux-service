@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.0.1"
+readonly INSTALLER_VERSION="1.0.2"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -30,7 +30,6 @@ readonly INSTALL_DIR="/opt/psiphon-tun"  # Base installation directory with rest
 readonly PSIPHON_DIR="$INSTALL_DIR/psiphon" # Secure binary and config storage location
 readonly PSIPHON_BINARY="$PSIPHON_DIR/psiphon-tunnel-core"
 readonly PSIPHON_CONFIG_FILE="$PSIPHON_DIR/psiphon.config"
-readonly CONFIG_FILE="$INSTALL_DIR/config"
 readonly LOG_FILE="$INSTALL_DIR/psiphon-tun.log"
 readonly LOCK_FILE="/run/psiphon-tun.lock"
 readonly PID_FILE="/run/psiphon-tun.pid"
@@ -44,14 +43,12 @@ readonly TUN_SUBNET="10.200.3.0/24"      # IPv4 subnet for tunnel traffic isolat
 readonly TUN_IP="10.200.3.1"             # IPv4 gateway address for tunnel
 readonly TUN_SUBNET6="fd42:42:42::/64"   # IPv6 subnet (ULA) for tunnel traffic isolation
 readonly TUN_IP6="fd42:42:42::1"         # IPv6 gateway address for tunnel
-# Secure fallback for interface selection: default route with non-loopback fallback
-readonly TUN_BYPASS_INTERFACE=$(ip -json route get 8.8.8.8 2>/dev/null | jq -r '.[0].dev // empty' || 
-                              ip -json link show | jq -r '.[] | select(.link_type!="loopback") | .ifname' | head -n1)
 readonly TUN_DNS_SERVERS="8.8.8.8,8.8.4.4" # Google DNS
 readonly TUN_DNS_SERVERS6="2001:4860:4860::8888,2001:4860:4860::8844" # Google DNS IPv6
 SERVICE_MODE="false" # Set to true when running as a systemd service
-SERVICE_RELOAD="false" # Set to true when reloading service
-
+# Secure fallback for interface selection: default route with non-loopback fallback
+TUN_BYPASS_INTERFACE=$(ip -json route get 8.8.8.8 2>/dev/null | jq -r '.[0].dev // empty' || 
+                              ip -json link show | jq -r '.[] | select(.link_type!="loopback") | .ifname' | head -n1)
 # Colors for output
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -62,37 +59,46 @@ readonly NC='\033[0m' # No Color
 # Logging functions
 function log() {
     local message="$1"
-    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    # We want to avoid errors if date command fails
+    # shellcheck disable=SC2155
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S') || true
     echo -e "${BLUE}[$timestamp]${NC} $message"
+    # We want to avoid errors if log file is not writable
+    # shellcheck disable=SC2015
     [[ -w "$LOG_FILE" || -w "$(dirname "$LOG_FILE")" ]] && echo "[$timestamp] $message" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 function error() {
     local message="$1"
-    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    # We want to avoid errors if date command fails
+    # shellcheck disable=SC2155
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S') || true
     echo -e "${RED}[$timestamp][ERROR]${NC} $message" >&2
+    # We want to avoid errors if log file is not writable
+    # shellcheck disable=SC2015
     [[ -w "$LOG_FILE" || -w "$(dirname "$LOG_FILE")" ]] && echo "[$timestamp] ERROR: $message" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 function success() {
     local message="$1"
-    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    # We want to avoid errors if date command fails
+    # shellcheck disable=SC2155
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S') || true
     echo -e "${GREEN}[$timestamp][SUCCESS]${NC} $message"
+    # We want to avoid errors if log file is not writable
+    # shellcheck disable=SC2015
     [[ -w "$LOG_FILE" || -w "$(dirname "$LOG_FILE")" ]] && echo "[$timestamp] $message" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 function warning() {
     local message="$1"
-    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    # We want to avoid errors if date command fails
+    # shellcheck disable=SC2155
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S') || true
     echo -e "${YELLOW}[$timestamp][WARNING]${NC} $message"
+    # We want to avoid errors if log file is not writable
+    # shellcheck disable=SC2015
     [[ -w "$LOG_FILE" || -w "$(dirname "$LOG_FILE")" ]] && echo "[$timestamp] WARNING: $message" >> "$LOG_FILE" 2>/dev/null || true
-}
-
-function psiphonlog() {
-    local message="$1"
-    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
-    echo -e "${BLUE}[$timestamp]${NC} $message"
-    [[ -w "$LOG_FILE" || -w "$(dirname "$LOG_FILE")" ]] && echo "[$timestamp] $message" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 # Security Validation Functions
@@ -189,8 +195,9 @@ function get_latest_psiphon_info() {
         error "Invalid response from GitHub API"
         return 1
     fi
-
-    local commit_message=$(echo "$latest_commit" | jq -r '.[0].commit.message' 2>/dev/null || echo "")
+    # We want to avoid errors if jq fails. We check later if commit_message is empty
+    # shellcheck disable=SC2155
+    local commit_message=$(echo "$latest_commit" | jq -r '.[0].commit.message' 2>/dev/null || echo "") || true
 
     if [[ -z "$commit_message" ]] || [[ "$commit_message" == "null" ]]; then
         error "Failed to parse commit information"
@@ -220,7 +227,8 @@ function get_binary_version_info() {
             return
         fi
     fi
-
+    # We want to avoid errors if grep or sed fails. It's okay if build_date or revision is empty
+    # shellcheck disable=SC2155
     local revision=$(echo "$version_output" | grep "Revision:" | sed 's/Revision: //' | xargs || echo "")
 
     echo "$revision"
@@ -299,7 +307,10 @@ function check_and_update_psiphon() {
     fi
 
     # Get current binary info
-    local current_revision=$(get_binary_version_info)
+    # We want to avoid errors if get_binary_version_info fails
+    # We download anyway if we cannot determine current version
+    # shellcheck disable=SC2155
+    local current_revision=$(get_binary_version_info) || true
 
     log "Latest revision: $latest_commit_msg"
     log "Current binary Revision: $current_revision"
@@ -348,6 +359,9 @@ function check_and_update_psiphon() {
 function create_psiphon_config() {
     log "Creating Psiphon configuration..."
 
+    # See the AvailableEgressRegions in Psiphon logs for valid region codes
+    # Example:
+    # Change to `"EgressRegion": "US",` if you want to force to choose US servers
     cat > "$PSIPHON_CONFIG_FILE" << 'EOF'
 {
     "LocalHttpProxyPort": 8081,
@@ -918,6 +932,8 @@ function cleanup_routing() {
 function stop_services() {
     log "Stopping services..."
 
+    local stopped_something=false
+
     if [[ "$SERVICE_MODE" == "true" ]]; then
         systemctl stop $SERVICE_BINARY_NAME.service
         # Check if still running
@@ -1088,7 +1104,7 @@ function status() {
         local test_ip
         if test_ip=$(timeout 10 curl -s --interface "$TUN_INTERFACE" --connect-timeout 5 ifconfig.me 2>/dev/null); then
             # check for both IPv4 and IPv6 format
-            if [[ -n "$test_ip" ]] && ([[ "$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$test_ip" =~ ^[0-9a-f:]+$ ]]); then
+            if [[ -n "$test_ip" && ( "$test_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$test_ip" =~ ^[0-9a-f:]+$ ) ]]; then
                 echo -e "External IP via TUN: ${GREEN}$test_ip${NC}"
             else
                 echo -e "Connection Test: ${YELLOW}UNEXPECTED RESULT${NC} ($test_ip)"
@@ -1207,6 +1223,7 @@ SECURITY FEATURES:
 NETWORK CONFIGURATION:
     • TUN Interface: $TUN_INTERFACE ($TUN_IP)
     • SOCKS Proxy: 127.0.0.1:$SOCKS_PORT
+    • HTTP Proxy: 127.0.0.1:$HTTP_PORT
     • Traffic routing excludes Psiphon user to prevent loops
 
 FILES:
