@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.1.0"
+readonly INSTALLER_VERSION="1.1.1"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -1020,8 +1020,7 @@ function open_sponsor_url() {
     (
         # Use timeout for safety
         timeout 7s \
-        runuser -u "$ACTIVE_USER" \
-        --shell=/bin/bash \
+        exec runuser -u "$ACTIVE_USER" \
         --whitelist-environment=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR \
         -- "$gio_path" open "$SPONSOR_URL" >/dev/null 2>&1 &
     )
