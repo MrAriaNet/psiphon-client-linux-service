@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.0.2"
+readonly INSTALLER_VERSION="1.1.0"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -31,12 +31,19 @@ readonly PSIPHON_DIR="$INSTALL_DIR/psiphon" # Secure binary and config storage l
 readonly PSIPHON_BINARY="$PSIPHON_DIR/psiphon-tunnel-core"
 readonly PSIPHON_CONFIG_FILE="$PSIPHON_DIR/psiphon.config"
 readonly LOG_FILE="$INSTALL_DIR/psiphon-tun.log"
+readonly PSIPHON_LOG_FILE="$INSTALL_DIR/psiphon-core.log"
+readonly PSIPHON_SPONSOR_HOMEPAGE_PATH="$INSTALL_DIR/data/ca.psiphon.PsiphonTunnel.tunnel-core/homepage"
 readonly LOCK_FILE="/run/psiphon-tun.lock"
 readonly PID_FILE="/run/psiphon-tun.pid"
+
 readonly GITHUB_API="https://api.github.com/repos/Psiphon-Labs/psiphon-tunnel-core-binaries"
 readonly PSIPHON_BINARY_URL="https://github.com/Psiphon-Labs/psiphon-tunnel-core-binaries/raw/master/linux/psiphon-tunnel-core-x86_64"
+
 readonly SERVICE_CONFIGURE_NAME="psiphon-tun"
 readonly SERVICE_BINARY_NAME="psiphon-binary"
+# readonly SERVICE_HOMEPAGE_MONITOR="psiphon-homepage-monitor"
+# readonly SERVICE_HOMEPAGE_TRIGGER="psiphon-homepage-trigger"
+
 # Network Security Configuration
 readonly TUN_INTERFACE="PsiphonTUN"      # Dedicated TUN interface for isolated traffic
 readonly TUN_SUBNET="10.200.3.0/24"      # IPv4 subnet for tunnel traffic isolation
@@ -45,10 +52,13 @@ readonly TUN_SUBNET6="fd42:42:42::/64"   # IPv6 subnet (ULA) for tunnel traffic 
 readonly TUN_IP6="fd42:42:42::1"         # IPv6 gateway address for tunnel
 readonly TUN_DNS_SERVERS="8.8.8.8,8.8.4.4" # Google DNS
 readonly TUN_DNS_SERVERS6="2001:4860:4860::8888,2001:4860:4860::8844" # Google DNS IPv6
-SERVICE_MODE="false" # Set to true when running as a systemd service
+
 # Secure fallback for interface selection: default route with non-loopback fallback
 TUN_BYPASS_INTERFACE=$(ip -json route get 8.8.8.8 2>/dev/null | jq -r '.[0].dev // empty' || 
                               ip -json link show | jq -r '.[] | select(.link_type!="loopback") | .ifname' | head -n1)
+
+SERVICE_MODE="false" # Set to true when running as a systemd service
+
 # Colors for output
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -215,17 +225,9 @@ function get_binary_version_info() {
 
     local version_output
 
-    # In service mode, run directly without backgrounding
-    if [[ "$SERVICE_MODE" == "true" ]]; then
-        if ! version_output=$(exec runuser -u "$PSIPHON_USER" -- "$PSIPHON_BINARY" -v 2>/dev/null); then
-            echo "|"
-            return 
-        fi
-    else 
-        if ! version_output=$(sudo -u "$PSIPHON_USER" "$PSIPHON_BINARY" -v 2>/dev/null); then
-            echo "|"
-            return
-        fi
+    if ! version_output=$(exec runuser -u "$PSIPHON_USER" -- "$PSIPHON_BINARY" -v 2>/dev/null); then
+        echo "|"
+        return 
     fi
     # We want to avoid errors if grep or sed fails. It's okay if build_date or revision is empty
     # shellcheck disable=SC2155
@@ -386,7 +388,7 @@ EOF
 }
 
 # Systemd service
-function create_systemd_service() {
+function create_systemd_services() {
     log "Creating systemd service..."
 
     local service_script="$INSTALL_DIR/psiphon-tun-service.sh"
@@ -494,6 +496,41 @@ SecureBits=noroot-locked
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # TODO: Implement homepage monitor and trigger if it can be done securely
+
+#     # Create homepage monitor service
+#     tee /etc/systemd/system/$SERVICE_HOMEPAGE_MONITOR.path >/dev/null <<EOF
+# [Unit]
+# Description=Psiphon Homepage Monitor
+
+# [Path]
+# PathModified=$PSIPHON_SPONSOR_HOMEPAGE_PATH
+# Unit=$SERVICE_HOMEPAGE_TRIGGER.service
+
+# [Install]
+# WantedBy=multi-user.target
+# EOF
+
+#     # Get the active logged-in user
+#     # This checks for the active display manager session.
+#     ACTIVE_USER=$(logname)
+#     # Create the trigger service
+#     tee /etc/systemd/system/$SERVICE_HOMEPAGE_TRIGGER.service >/dev/null <<EOF
+# [Unit]
+# Description=Psiphon Homepage Change Handler
+
+# [Service]
+# Type=oneshot
+# ExecStart=$service_script something
+# User=$ACTIVE_USER
+
+# # Security settings
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=strict
+# ProtectHome=true
+# EOF
 
     # Copy this script to install directory
     cp -f "$0" "$INSTALL_DIR/psiphon-tun.sh"
@@ -841,6 +878,10 @@ function start_psiphon() {
 
     # In service mode, run as a systemd service
     if [[ "$SERVICE_MODE" == "true" ]]; then
+        # log "start the homepage monitor service..."
+        # systemctl start $SERVICE_HOMEPAGE_MONITOR.path
+        # sleep 1
+        # log "start the psiphon binary service..."
         systemctl start $SERVICE_BINARY_NAME.service
         log "Run: systemctl status $SERVICE_BINARY_NAME.service"
         log "   to check the status of the Psiphon binary service."
@@ -855,7 +896,7 @@ function start_psiphon() {
             -tunBindInterface "$TUN_BYPASS_INTERFACE" \
             -tunDNSServers "$TUN_DNS_SERVERS,$TUN_DNS_SERVERS6" \
             -formatNotices \
-            -useNoticeFiles 2>&1 | sudo -u "$PSIPHON_USER" tee -a "$LOG_FILE" &
+            -useNoticeFiles 2>&1 | sudo -u "$PSIPHON_USER" tee -a "$PSIPHON_LOG_FILE" &
 
         local psiphon_pid=$!
 
@@ -863,13 +904,21 @@ function start_psiphon() {
 
         # Wait until connected
         log "waiting psiphon to connect..."
-        until tail -n 5 "$LOG_FILE" | grep -q "ConnectedServerRegion"
+        until tail -n 5 "$PSIPHON_LOG_FILE" | grep -q "ConnectedServerRegion"
         do
             echo -n "."
             sleep 1
         done
 
         echo ""
+
+        # Open sponsor URL securely
+        # We ignore errors here to avoid blocking startup
+        if open_sponsor_url; then
+            log "Sponsor URL opened successfully"
+        else
+            warning "Failed to open sponsor URL"
+        fi
 
         # Verify process started successfully
         if [[ -z "$psiphon_pid" ]] || ! kill -0 "$psiphon_pid" 2>/dev/null; then
@@ -892,6 +941,93 @@ function start_psiphon() {
 
         success "Psiphon started successfully with native TUN support (PID: $psiphon_pid)"
     fi
+}
+
+function open_sponsor_url() {
+    # Open sponsor URL with enhanced security
+    if [[ -z "$PSIPHON_SPONSOR_HOMEPAGE_PATH" || ! -f "$PSIPHON_SPONSOR_HOMEPAGE_PATH" ]]; then
+        warning "Invalid or missing homepage file"
+        return 1
+    fi
+
+    # Verify file permissions and ownership
+    local file_perms
+    file_perms=$(stat -c "%a" "$PSIPHON_SPONSOR_HOMEPAGE_PATH" 2>/dev/null)
+    if [[ "$file_perms" != "600" && "$file_perms" != "644" ]]; then
+        warning "Invalid homepage file permissions: $file_perms (expected 600 or 644)"
+        return 1
+    fi
+
+    # Extract and validate URL using jq with explicit error checking
+    local SPONSOR_URL
+    if ! SPONSOR_URL=$(jq -r '.data.url // empty' "$PSIPHON_SPONSOR_HOMEPAGE_PATH" 2>/dev/null); then
+        warning "Failed to parse homepage JSON file"
+        return 1
+    fi
+
+    # Enhanced URL validation
+    if [[ -z "$SPONSOR_URL" || "$SPONSOR_URL" == "null" ]]; then
+        warning "Empty or null sponsor URL"
+        return 1
+    fi
+
+    # Primary security check: URL pattern validation
+    local url_regex='^https://ipfounder\.net/\?sponsor_id=[A-Za-z0-9]+[^[:space:]]*$'
+    if [[ ! "$SPONSOR_URL" =~ $url_regex ]]; then
+        warning "Invalid sponsor URL format detected"
+        log "Security: Blocked attempt to open non-conforming URL"
+        return 1
+    fi
+
+    # Secondary security check: Additional URL validation
+    if [[ ${#SPONSOR_URL} -gt 500 ]]; then
+        warning "URL exceeds maximum allowed length"
+        return 1
+    fi
+
+    # Additional security: Check for suspicious characters
+    if echo "$SPONSOR_URL" | grep -q '[;<>`|]'; then
+        warning "URL contains suspicious characters"
+        log "Security: Blocked URL with potentially dangerous characters"
+        return 1
+    fi
+
+    # Get the active logged-in user with validation
+    local ACTIVE_USER
+    ACTIVE_USER="$(logname)"
+    if [[ -z "$ACTIVE_USER" || "$ACTIVE_USER" == "root" ]]; then
+        warning "No suitable non-root user found to open URL"
+        return 1
+    fi
+
+    # Verify the user exists and is valid
+    if ! id "$ACTIVE_USER" >/dev/null 2>&1; then
+        warning "Invalid user account"
+        return 1
+    fi
+
+    # Check for gio command with full path
+    local gio_path
+    if ! gio_path=$(command -v gio 2>/dev/null); then
+        warning "gio command not found"
+        return 1
+    fi
+
+    log "Opening verified sponsor URL for user: $ACTIVE_USER"
+    log "Sponsor URL: $SPONSOR_URL"
+
+    # Execute with timeout and restricted environment
+    (
+        # Use timeout for safety
+        timeout 7s \
+        runuser -u "$ACTIVE_USER" \
+        --shell=/bin/bash \
+        --whitelist-environment=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR \
+        -- "$gio_path" open "$SPONSOR_URL" >/dev/null 2>&1 &
+    )
+
+    log "URL_OPEN: user=$ACTIVE_USER url_hash=$(echo -n "$SPONSOR_URL" | sha256sum | cut -d' ' -f1)"
+    return 0
 }
 
 # Start all services
@@ -935,6 +1071,14 @@ function stop_services() {
     local stopped_something=false
 
     if [[ "$SERVICE_MODE" == "true" ]]; then
+        # systemctl stop $SERVICE_HOMEPAGE_MONITOR.path
+        # if systemctl is-active --quiet $SERVICE_HOMEPAGE_MONITOR.path 2>/dev/null; then
+        #     warning "Psiphon homepage monitor service did not stop cleanly, attempting to kill process..."
+        # else
+        #     log "Psiphon homepage monitor service stopped."
+        #     stopped_something=true
+        # fi
+        
         systemctl stop $SERVICE_BINARY_NAME.service
         # Check if still running
         if systemctl is-active --quiet $SERVICE_BINARY_NAME.service 2>/dev/null; then
@@ -943,6 +1087,23 @@ function stop_services() {
             log "Psiphon binary service stopped."
             stopped_something=true
         fi
+
+        # systemctl stop $SERVICE_HOMEPAGE_TRIGGER.service
+        # if systemctl is-active --quiet $SERVICE_HOMEPAGE_TRIGGER.service 2>/dev/null; then
+        #     warning "Psiphon homepage trigger service did not stop cleanly."
+        # else
+        #     log "Psiphon homepage trigger service stopped."
+        #     stopped_something=true
+        # fi
+
+        systemctl stop $SERVICE_CONFIGURE_NAME.service
+        if systemctl is-active --quiet $SERVICE_CONFIGURE_NAME.service 2>/dev/null; then
+            warning "Psiphon configuration service did not stop cleanly."
+        else
+            log "Psiphon configuration service stopped."
+            stopped_something=true
+        fi
+
     fi
 
     # Stop Psiphon
@@ -1008,7 +1169,7 @@ function install_shell() {
     check_and_update_psiphon
     create_psiphon_config
 
-    create_systemd_service
+    create_systemd_services
 
     success "Psiphon TUN setup installed successfully"
     log "Use '$0 start' to start the service"
@@ -1021,18 +1182,23 @@ function uninstall() {
     log "Uninstalling Psiphon TUN setup..."
 
     # Stop services first
-    if systemctl is-active --quiet "$SERVICE_CONFIGURE_NAME" 2>/dev/null; then
-        systemctl stop "$SERVICE_CONFIGURE_NAME" 2>/dev/null || true
-    fi
-
+    stop_services
+    # Disable and remove systemd configuration services
     if systemctl is-enabled --quiet "$SERVICE_CONFIGURE_NAME" 2>/dev/null; then
         systemctl disable "$SERVICE_CONFIGURE_NAME" 2>/dev/null || true
     fi
+    # Disable and remove systemd binary services
+    if systemctl is-enabled --quiet "$SERVICE_BINARY_NAME" 2>/dev/null; then
+        systemctl disable "$SERVICE_BINARY_NAME" 2>/dev/null || true
+    fi
 
     rm -f /etc/systemd/system/$SERVICE_CONFIGURE_NAME.service
+    rm -f /etc/systemd/system/$SERVICE_BINARY_NAME.service
+    # rm -f /etc/systemd/system/$SERVICE_HOMEPAGE_MONITOR.path
+    # rm -f /etc/systemd/system/$SERVICE_HOMEPAGE_TRIGGER.service
+
     systemctl daemon-reload 2>/dev/null || true
 
-    stop_services
 
     # Remove installation directory
     if [[ -d "$INSTALL_DIR" ]]; then
