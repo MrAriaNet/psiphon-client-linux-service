@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.1.1"
+readonly INSTALLER_VERSION="1.1.2"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -1006,9 +1006,7 @@ function open_sponsor_url() {
         return 1
     fi
 
-    # Check for gio command with full path
-    local gio_path
-    if ! gio_path=$(command -v gio 2>/dev/null); then
+    if ! command -v gio >/dev/null 2>&1; then
         warning "gio command not found"
         return 1
     fi
@@ -1016,13 +1014,11 @@ function open_sponsor_url() {
     log "Opening verified sponsor URL for user: $ACTIVE_USER"
     log "Sponsor URL: $SPONSOR_URL"
 
-    # Execute with timeout and restricted environment
+    # Execute with restricted environment
     (
-        # Use timeout for safety
-        timeout 7s \
         exec runuser -u "$ACTIVE_USER" \
         --whitelist-environment=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR \
-        -- "$gio_path" open "$SPONSOR_URL" >/dev/null 2>&1 &
+        -- gio open "$SPONSOR_URL" >/dev/null 2>&1 &
     )
 
     log "URL_OPEN: user=$ACTIVE_USER url_hash=$(echo -n "$SPONSOR_URL" | sha256sum | cut -d' ' -f1)"
