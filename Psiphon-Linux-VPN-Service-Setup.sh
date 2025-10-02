@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.1.2"
+readonly INSTALLER_VERSION="1.1.3"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -54,7 +54,7 @@ readonly TUN_DNS_SERVERS="8.8.8.8,8.8.4.4" # Google DNS
 readonly TUN_DNS_SERVERS6="2001:4860:4860::8888,2001:4860:4860::8844" # Google DNS IPv6
 
 # Secure fallback for interface selection: default route with non-loopback fallback
-TUN_BYPASS_INTERFACE=$(ip -json route get 8.8.8.8 2>/dev/null | jq -r '.[0].dev // empty' || 
+TUN_BYPASS_INTERFACE=$(ip -json route get 8.8.8.8 2>/dev/null | jq -r '.[0].dev // empty' ||
                               ip -json link show | jq -r '.[] | select(.link_type!="loopback") | .ifname' | head -n1)
 
 SERVICE_MODE="false" # Set to true when running as a systemd service
@@ -227,7 +227,7 @@ function get_binary_version_info() {
 
     if ! version_output=$(exec runuser -u "$PSIPHON_USER" -- "$PSIPHON_BINARY" -v 2>/dev/null); then
         echo "|"
-        return 
+        return
     fi
     # We want to avoid errors if grep or sed fails. It's okay if build_date or revision is empty
     # shellcheck disable=SC2155
@@ -292,7 +292,7 @@ function download_psiphon() {
     # chown "$PSIPHON_USER:$PSIPHON_GROUP" "$PSIPHON_BINARY"
     install -m 750 -o "$PSIPHON_USER" -g "$PSIPHON_GROUP" "$temp_file" "$PSIPHON_BINARY"
 
-    
+
     # Clean up temp file before successful return
     rm -f "$temp_file" 2>/dev/null || true
 
@@ -564,16 +564,16 @@ EOF
 
     # Set proper permissions
     chmod 644 /etc/resolv.conf
-    
+
     # # Setup routing table for DNS
     # for dns in 8.8.8.8 8.8.4.4; do
     #     ip route add $dns via $(ip route | grep default | grep -v $TUN_INTERFACE | awk '{print $3}') dev $TUN_BYPASS_INTERFACE proto static
     # done
-    
+
     else
 
         if [ -f /etc/systemd/resolved.conf.d/psiphon-tun.conf ]; then
-            
+
             # Create resolved.conf drop-in directory if it doesn't exist
             mkdir -p /etc/systemd/resolved.conf.d/
 
@@ -611,20 +611,20 @@ function setup_tun_interface() {
     if ! ip addr flush dev "$TUN_INTERFACE" 2>&1; then
         warning "Failed to flush TUN interface: $?"
     fi
-    
+
     # Configure both IPv4 and IPv6 addresses
     if ! ip addr add "$TUN_IP/24" dev "$TUN_INTERFACE" metric 50 2>&1; then
         warning "Failed to add IPv4 address to TUN interface: $?"
     fi
-    
+
     # Configure IPv6 interface with unique local address
     if ! ip -6 addr add "$TUN_IP6/64" dev "$TUN_INTERFACE" 2>&1; then
         warning "Failed to add IPv6 address to TUN interface: $?"
     fi
-    
+
     # Bring up interface and wait for it to be ready
     ip link set "$TUN_INTERFACE" up
-    
+
     # Wait for interface to be ready (both IPv4 and IPv6)
     local timeout=10
     local count=0
@@ -636,63 +636,20 @@ function setup_tun_interface() {
         sleep 1
         count=$((count + 1))
     done
-    
+
     if [ $count -eq $timeout ]; then
         warning "Timeout waiting for TUN interface to be fully ready"
     else
         log "TUN interface ready with both IPv4 and IPv6 addresses"
     fi
 
-    # Delete any existing default routes for TUN interface first
-    ip route del default dev "$TUN_INTERFACE" 2>/dev/null || true
-    ip -6 route del default dev "$TUN_INTERFACE" 2>/dev/null || true
-    
-    # Set up IPv4 routing first
-    if ! ip route add default dev "$TUN_INTERFACE" metric 50 2>&1; then
-        error "Failed to add IPv4 default route to TUN table: $?"
-        ip route show
-        return 1
-    fi
-    
-    # Verify IPv4 routing is working
-    local retry_count=0
-    while [ $retry_count -lt 3 ]; do
-        if ip route show default | grep -q "$TUN_INTERFACE"; then
-            log "IPv4 routing verified"
-            break
-        fi
-        sleep 1
-        retry_count=$((retry_count + 1))
-    done
-    
-    # Set up IPv6 routing
-    if ! ip -6 route add default dev "$TUN_INTERFACE" metric 50 pref high 2>&1; then
-        error "Failed to add IPv6 default route to TUN table: $?"
-        ip -6 route show
-        return 1
-    fi
-    
-    # Verify IPv6 routing is working
-    retry_count=0
-    while [ $retry_count -lt 3 ]; do
-        if ip -6 route show default | grep -q "$TUN_INTERFACE"; then
-            log "IPv6 routing verified"
-            break
-        fi
-        sleep 1
-        retry_count=$((retry_count + 1))
-    done
-    
-    # Show routing table for debugging
-    log "Current IPv4 routes:"
-    ip route show
-    log "Current IPv6 routes:"
-    ip -6 route show
-    
+    # DON'T add default routes here - wait for RA processing
+    log "TUN interface configured (routes will be added after RA processing)"
+
     # Update DNS configuration after routes are established
     change_dns_config
 
-    success "TUN interface configured with IPv4 and IPv6"
+    success "TUN interface configured with IPv4 and IPv6 addresses"
 }
 
 # Network Security and Kill Switch Implementation
@@ -769,7 +726,7 @@ function setup_routing() {
     success "IPv4 and IPv6 Routing configured"
 }
 
-# Add this function after setup_routing()
+# setting up IPv6 routing
 function setup_ipv6_routing() {
     log "Setting up IPv6 routing..."
 
@@ -797,7 +754,7 @@ function setup_ipv6_routing() {
     # Setup ip6tables rules for TUN interface
     ip6tables -F 2>/dev/null || true
     ip6tables -t nat -F 2>/dev/null || true
-    
+
     # Kill Switch: Block all IPv6 traffic that is not going through the TUN interface
     log "Implementing IPv6 kill switch..."
     # Set default policy to DROP for output.
@@ -836,6 +793,98 @@ function setup_ipv6_routing() {
     # ip6tables -t nat -A OUTPUT -p tcp --dport 53 -m owner ! --uid-owner "$PSIPHON_USER" -j DNAT --to-destination "$DNS_SERVER_IP6"
 
     success "IPv6 routing configured"
+}
+
+function wait_for_ra_processing() {
+    log "Waiting for Router Advertisement processing..."
+
+    local timeout=30
+    local count=0
+
+    # Wait for any IPv6 changes to settle
+    # This includes both native network RA and tunnel RA
+    while [ $count -lt $timeout ]; do
+        local current_routes
+        current_routes=$(ip -6 route show 2>/dev/null | md5sum)
+
+        # Wait a bit
+        sleep 2
+        count=$((count + 2))
+
+        # Check if routes have stabilized
+        local new_routes
+        new_routes=$(ip -6 route show 2>/dev/null | md5sum)
+
+        if [ "$current_routes" = "$new_routes" ]; then
+            # Routes stable for 2 seconds
+            log "IPv6 routes stabilized"
+            break
+        else
+            log "IPv6 routes still changing, waiting... ($count/$timeout)"
+        fi
+    done
+
+    if [ $count -ge $timeout ]; then
+        warning "IPv6 route changes didn't stabilize within $timeout seconds, proceeding"
+    fi
+
+    # Log final IPv6 state
+    log "Final IPv6 route state:"
+    ip -6 route show
+
+    success "RA processing wait completed"
+}
+
+function setup_tun_routes_after_ra() {
+    log "Setting up TUN routes after RA processing..."
+
+    # Delete any existing default routes for TUN interface first
+    ip route del default dev "$TUN_INTERFACE" 2>/dev/null || true
+    ip -6 route del default dev "$TUN_INTERFACE" 2>/dev/null || true
+
+    # Set up IPv4 routing
+    if ! ip route add default dev "$TUN_INTERFACE" metric 50 2>&1; then
+        error "Failed to add IPv4 default route to TUN table: $?"
+        ip route show
+        return 1
+    fi
+
+    # Verify IPv4 routing is working
+    local retry_count=0
+    while [ $retry_count -lt 3 ]; do
+        if ip route show default | grep -q "$TUN_INTERFACE"; then
+            log "IPv4 routing verified"
+            break
+        fi
+        sleep 1
+        retry_count=$((retry_count + 1))
+    done
+
+    # Set up IPv6 routing
+    if ! ip -6 route add default dev "$TUN_INTERFACE" metric 50 pref high 2>&1; then
+        error "Failed to add IPv6 default route to TUN table: $?"
+        ip -6 route show
+        return 1
+    fi
+
+    # Verify IPv6 routing is working
+    retry_count=0
+    while [ $retry_count -lt 3 ]; do
+        if ip -6 route show default | grep -q "$TUN_INTERFACE"; then
+            log "IPv6 routing verified"
+            break
+        fi
+        sleep 1
+        retry_count=$((retry_count + 1))
+    done
+
+    # Show routing table for debugging
+    log "Final IPv4 routes:"
+    ip route show
+    log "Final IPv6 routes:"
+    ip -6 route show
+
+    success "TUN routes configured after RA processing"
 }
 
 # systemd service psiphon binary restart helper
@@ -887,7 +936,7 @@ function start_psiphon() {
         log "   to check the status of the Psiphon binary service."
     else
         # For manual mode, keep the background process
-        
+
         # Start Psiphon with native TUN support
         sudo -u "$PSIPHON_USER" "$PSIPHON_BINARY" \
             -config "$PSIPHON_CONFIG_FILE" \
@@ -1073,7 +1122,7 @@ function stop_services() {
         #     log "Psiphon homepage monitor service stopped."
         #     stopped_something=true
         # fi
-        
+
         systemctl stop $SERVICE_BINARY_NAME.service
         # Check if still running
         if systemctl is-active --quiet $SERVICE_BINARY_NAME.service 2>/dev/null; then
@@ -1090,15 +1139,6 @@ function stop_services() {
         #     log "Psiphon homepage trigger service stopped."
         #     stopped_something=true
         # fi
-
-        systemctl stop $SERVICE_CONFIGURE_NAME.service
-        if systemctl is-active --quiet $SERVICE_CONFIGURE_NAME.service 2>/dev/null; then
-            warning "Psiphon configuration service did not stop cleanly."
-        else
-            log "Psiphon configuration service stopped."
-            stopped_something=true
-        fi
-
     fi
 
     # Stop Psiphon
@@ -1157,7 +1197,7 @@ function stop_services() {
 # Install everything
 function install_shell() {
     log "Installing Psiphon TUN setup..."
-    
+
     check_dependencies
     create_user
     create_directories
@@ -1185,6 +1225,22 @@ function uninstall() {
     # Disable and remove systemd binary services
     if systemctl is-enabled --quiet "$SERVICE_BINARY_NAME" 2>/dev/null; then
         systemctl disable "$SERVICE_BINARY_NAME" 2>/dev/null || true
+    fi
+    # # Disable and remove homepage monitor service
+    # if systemctl is-enabled --quiet "$SERVICE_HOMEPAGE_MONITOR" 2>/dev/null; then
+    #     systemctl disable "$SERVICE_HOMEPAGE_MONITOR" 2>/dev/null || true
+    # fi
+    # # Disable and remove homepage trigger service
+    # if systemctl is-enabled --quiet "$SERVICE_HOMEPAGE_TRIGGER" 2>/dev/null; then
+    #     systemctl disable "$SERVICE_HOMEPAGE_TRIGGER" 2>/dev/null || true
+    # fi
+
+    systemctl stop $SERVICE_CONFIGURE_NAME.service
+    if systemctl is-active --quiet $SERVICE_CONFIGURE_NAME.service 2>/dev/null; then
+        warning "Psiphon configuration service did not stop cleanly."
+    else
+        log "Psiphon configuration service stopped."
+        stopped_something=true
     fi
 
     rm -f /etc/systemd/system/$SERVICE_CONFIGURE_NAME.service
@@ -1249,7 +1305,7 @@ function status() {
         echo -e "TUN Interface: ${RED}DOWN${NC} ($TUN_INTERFACE)"
     fi
 
-    # Check Routing 
+    # Check Routing
     echo ""
     echo "=== Routing Status ==="
     if ip route | grep -q "$TUN_INTERFACE"; then
@@ -1283,7 +1339,7 @@ function status() {
         ipv6_addr=$(ip -6 addr show dev "$TUN_INTERFACE" | grep -o 'inet6 [0-9a-f:]*' | cut -d' ' -f2 || echo "No IPv6")
         echo -e "IPv6 Support: ${GREEN}ENABLED${NC}"
         echo -e "TUN IPv6: ${GREEN}$ipv6_addr${NC}"
-        
+
         # # Test IPv6 connectivity
         # if timeout 10 ping6 -c 1 2606:4700:4700::1001 >/dev/null 2>&1; then
         #     echo -e "IPv6 Connectivity: ${GREEN}OK${NC}"
@@ -1430,6 +1486,8 @@ function main() {
             check_and_update_psiphon
             setup_tun_interface
             setup_routing
+            wait_for_ra_processing
+            setup_tun_routes_after_ra
             start_services
             ;;
         systemd_start)
@@ -1439,11 +1497,13 @@ function main() {
             check_and_update_psiphon
             setup_tun_interface
             setup_routing
+            wait_for_ra_processing
+            setup_tun_routes_after_ra
             start_services
             ;;
         reload)
             check_root
-            start_psiphon # it will first kill then start psiphon 
+            start_psiphon # it will first kill then start psiphon
             ;;
         systemd_reload)
             SERVICE_MODE="true"
@@ -1467,6 +1527,8 @@ function main() {
             sleep 3
             setup_tun_interface
             setup_routing
+            wait_for_ra_processing
+            setup_tun_routes_after_ra
             start_services
             ;;
         systemd_restart)
@@ -1476,6 +1538,8 @@ function main() {
             sleep 3
             setup_tun_interface
             setup_routing
+            wait_for_ra_processing
+            setup_tun_routes_after_ra
             start_services
             ;;
         status)
