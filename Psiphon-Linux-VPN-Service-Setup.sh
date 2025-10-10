@@ -41,8 +41,8 @@ readonly PSIPHON_BINARY_URL="https://github.com/Psiphon-Labs/psiphon-tunnel-core
 
 readonly SERVICE_CONFIGURE_NAME="psiphon-tun"
 readonly SERVICE_BINARY_NAME="psiphon-binary"
-# readonly SERVICE_HOMEPAGE_MONITOR="psiphon-homepage-monitor"
-# readonly SERVICE_HOMEPAGE_TRIGGER="psiphon-homepage-trigger"
+readonly SERVICE_HOMEPAGE_MONITOR="psiphon-homepage-monitor"
+readonly SERVICE_HOMEPAGE_TRIGGER="psiphon-homepage-trigger"
 
 # Network Security Configuration
 readonly TUN_INTERFACE="PsiphonTUN"      # Dedicated TUN interface for isolated traffic
@@ -480,8 +480,8 @@ ExecStart=$PSIPHON_BINARY -config $PSIPHON_CONFIG_FILE -dataRootDirectory $INSTA
 User=$PSIPHON_USER
 StandardOutput=journal
 StandardError=journal
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=7s
 
 # Security settings
 NoNewPrivileges=true
@@ -497,40 +497,48 @@ SecureBits=noroot-locked
 WantedBy=multi-user.target
 EOF
 
-    # TODO: Implement homepage monitor and trigger if it can be done securely
+    # Create homepage monitor service
+    tee /etc/systemd/system/$SERVICE_HOMEPAGE_MONITOR.path >/dev/null <<EOF
+[Unit]
+Description=Psiphon Homepage Monitor
 
-#     # Create homepage monitor service
-#     tee /etc/systemd/system/$SERVICE_HOMEPAGE_MONITOR.path >/dev/null <<EOF
-# [Unit]
-# Description=Psiphon Homepage Monitor
+[Path]
+PathModified=$PSIPHON_SPONSOR_HOMEPAGE_PATH
+Unit=$SERVICE_HOMEPAGE_TRIGGER.service
 
-# [Path]
-# PathModified=$PSIPHON_SPONSOR_HOMEPAGE_PATH
-# Unit=$SERVICE_HOMEPAGE_TRIGGER.service
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# [Install]
-# WantedBy=multi-user.target
-# EOF
+    # Get the active logged-in user
+    # This checks for the active display manager session.
+    ACTIVE_USER=$(logname)
+    ACTIVE_USER_ID=$(id -u "$ACTIVE_USER" 2>/dev/null || echo "1000")
+    # Create the trigger service
+    tee /etc/systemd/system/$SERVICE_HOMEPAGE_TRIGGER.service >/dev/null <<EOF
+[Unit]
+Description=Psiphon Homepage Change Handler
+# The service should only run after a graphical session has started.
+PartOf=graphical.target
+Requires=graphical.target
 
-#     # Get the active logged-in user
-#     # This checks for the active display manager session.
-#     ACTIVE_USER=$(logname)
-#     # Create the trigger service
-#     tee /etc/systemd/system/$SERVICE_HOMEPAGE_TRIGGER.service >/dev/null <<EOF
-# [Unit]
-# Description=Psiphon Homepage Change Handler
+[Service]
+Type=oneshot
+Environment="DISPLAY=:0"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$ACTIVE_USER_ID/bus"
+ExecStart=notify-send -a "$SERVICE_CONFIGURE_NAME" -u critical -i applications-internet -t 15000 "Psiphon connectivity has changed!" "run: 'systemctl status $SERVICE_BINARY_NAME' to check connection status"
+User=$ACTIVE_USER
 
-# [Service]
-# Type=oneshot
-# ExecStart=$service_script something
-# User=$ACTIVE_USER
+# TODO: Make this open the URL in the user's default browser **securely**
+# ExecStart=/bin/sh -c 'URL=\$(runuser -pu "$PSIPHON_USER" -- jq -r ".data.url" "$PSIPHON_SPONSOR_HOMEPAGE_PATH");echo "$\URL"; runuser -pu "$ACTIVE_USER" -- systemd-run --user xdg-open "\$URL" 2>/dev/null &'
+# User=root
 
-# # Security settings
-# NoNewPrivileges=true
-# PrivateTmp=true
-# ProtectSystem=strict
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
 # ProtectHome=true
-# EOF
+EOF
 
     # Copy this script to install directory
     cp -f "$0" "$INSTALL_DIR/psiphon-tun.sh"
@@ -927,10 +935,10 @@ function start_psiphon() {
 
     # In service mode, run as a systemd service
     if [[ "$SERVICE_MODE" == "true" ]]; then
-        # log "start the homepage monitor service..."
-        # systemctl start $SERVICE_HOMEPAGE_MONITOR.path
-        # sleep 1
-        # log "start the psiphon binary service..."
+        log "start the homepage monitor service..."
+        systemctl start $SERVICE_HOMEPAGE_MONITOR.path
+        sleep 1
+        log "start the psiphon binary service..."
         systemctl start $SERVICE_BINARY_NAME.service
         log "Run: systemctl status $SERVICE_BINARY_NAME.service"
         log "   to check the status of the Psiphon binary service."
@@ -1115,13 +1123,13 @@ function stop_services() {
     local stopped_something=false
 
     if [[ "$SERVICE_MODE" == "true" ]]; then
-        # systemctl stop $SERVICE_HOMEPAGE_MONITOR.path
-        # if systemctl is-active --quiet $SERVICE_HOMEPAGE_MONITOR.path 2>/dev/null; then
-        #     warning "Psiphon homepage monitor service did not stop cleanly, attempting to kill process..."
-        # else
-        #     log "Psiphon homepage monitor service stopped."
-        #     stopped_something=true
-        # fi
+        systemctl stop $SERVICE_HOMEPAGE_MONITOR.path
+        if systemctl is-active --quiet $SERVICE_HOMEPAGE_MONITOR.path 2>/dev/null; then
+            warning "Psiphon homepage monitor service did not stop cleanly, attempting to kill process..."
+        else
+            log "Psiphon homepage monitor service stopped."
+            stopped_something=true
+        fi
 
         systemctl stop $SERVICE_BINARY_NAME.service
         # Check if still running
@@ -1132,13 +1140,13 @@ function stop_services() {
             stopped_something=true
         fi
 
-        # systemctl stop $SERVICE_HOMEPAGE_TRIGGER.service
-        # if systemctl is-active --quiet $SERVICE_HOMEPAGE_TRIGGER.service 2>/dev/null; then
-        #     warning "Psiphon homepage trigger service did not stop cleanly."
-        # else
-        #     log "Psiphon homepage trigger service stopped."
-        #     stopped_something=true
-        # fi
+        systemctl stop $SERVICE_HOMEPAGE_TRIGGER.service
+        if systemctl is-active --quiet $SERVICE_HOMEPAGE_TRIGGER.service 2>/dev/null; then
+            warning "Psiphon homepage trigger service did not stop cleanly."
+        else
+            log "Psiphon homepage trigger service stopped."
+            stopped_something=true
+        fi
     fi
 
     # Stop Psiphon
@@ -1226,14 +1234,14 @@ function uninstall() {
     if systemctl is-enabled --quiet "$SERVICE_BINARY_NAME" 2>/dev/null; then
         systemctl disable "$SERVICE_BINARY_NAME" 2>/dev/null || true
     fi
-    # # Disable and remove homepage monitor service
-    # if systemctl is-enabled --quiet "$SERVICE_HOMEPAGE_MONITOR" 2>/dev/null; then
-    #     systemctl disable "$SERVICE_HOMEPAGE_MONITOR" 2>/dev/null || true
-    # fi
-    # # Disable and remove homepage trigger service
-    # if systemctl is-enabled --quiet "$SERVICE_HOMEPAGE_TRIGGER" 2>/dev/null; then
-    #     systemctl disable "$SERVICE_HOMEPAGE_TRIGGER" 2>/dev/null || true
-    # fi
+    # Disable and remove homepage monitor service
+    if systemctl is-enabled --quiet "$SERVICE_HOMEPAGE_MONITOR" 2>/dev/null; then
+        systemctl disable "$SERVICE_HOMEPAGE_MONITOR" 2>/dev/null || true
+    fi
+    # Disable and remove homepage trigger service
+    if systemctl is-enabled --quiet "$SERVICE_HOMEPAGE_TRIGGER" 2>/dev/null; then
+        systemctl disable "$SERVICE_HOMEPAGE_TRIGGER" 2>/dev/null || true
+    fi
 
     systemctl stop $SERVICE_CONFIGURE_NAME.service
     if systemctl is-active --quiet $SERVICE_CONFIGURE_NAME.service 2>/dev/null; then
@@ -1245,8 +1253,8 @@ function uninstall() {
 
     rm -f /etc/systemd/system/$SERVICE_CONFIGURE_NAME.service
     rm -f /etc/systemd/system/$SERVICE_BINARY_NAME.service
-    # rm -f /etc/systemd/system/$SERVICE_HOMEPAGE_MONITOR.path
-    # rm -f /etc/systemd/system/$SERVICE_HOMEPAGE_TRIGGER.service
+    rm -f /etc/systemd/system/$SERVICE_HOMEPAGE_MONITOR.path
+    rm -f /etc/systemd/system/$SERVICE_HOMEPAGE_TRIGGER.service
 
     systemctl daemon-reload 2>/dev/null || true
 
