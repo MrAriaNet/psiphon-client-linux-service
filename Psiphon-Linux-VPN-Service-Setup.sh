@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.3.0"
+readonly INSTALLER_VERSION="1.3.1"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -1399,7 +1399,7 @@ function start_psiphon() {
             warning "Could not verify tunnel IPv6 connectivity, but proceeding"
         fi
 
-        if [[ $is_connected < 2 ]]; then
+        if [[ $is_connected -lt 2 ]]; then
             warning "Consider the script manually!"
         fi
 
@@ -1737,11 +1737,6 @@ function get_warp_svc_pid() {
         warp_pid=$(pgrep -f "$WARP_SVC_PROCESS" 2>/dev/null | head -n1)
     fi
 
-    # Method 3: fallback to ps grep
-    if [[ -z "$warp_pid" ]]; then
-        warp_pid=$(ps aux | grep -v grep | grep "$WARP_SVC_PROCESS" | awk '{print $2}' | head -n1)
-    fi
-
     if [[ -n "$warp_pid" ]]; then
         echo "$warp_pid"
         return 0
@@ -1753,7 +1748,6 @@ function get_warp_svc_pid() {
 function warp_status() {
     echo "=== WARP Integration Status ==="
 
-    local proxyonly_over_warp="false"
     local psiphontunv4
     # Check WARP CLI availability
     if [[ -x "$WARP_CLI_PATH" ]]; then
@@ -1949,7 +1943,7 @@ function status() {
     echo -e "External IPv4 SOCKS port:\n$(timeout 10 curl -4sSm 7 -x socks5://127.0.0.1:$SOCKS_PORT https://cloudflare.com/cdn-cgi/trace)"
     echo ""
     sleep 1
-    echo -e "External IPv6 SOCKS port:\n$(timeout 10 curl -6sSm 7 -x socks5://[::ffff:127.0.0.1]:$SOCKS_PORT https://cloudflare.com/cdn-cgi/trace)"
+    echo -e "External IPv6 SOCKS port:\n$(timeout 10 curl -6sSm 7 -x "socks5://[::ffff:127.0.0.1]:$SOCKS_PORT" https://cloudflare.com/cdn-cgi/trace)"
     echo ""
 }
 
