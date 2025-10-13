@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.3.1"
+readonly INSTALLER_VERSION="1.3.2"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -648,17 +648,16 @@ function setup_tun_interface() {
 
     # Wait for interface to be ready (both IPv4 and IPv6)
     local timeout=10
-    local count=0
-    while [ $count -lt $timeout ]; do
+    while [ "$timeout" -gt 1 ]; do
         if ip addr show dev "$TUN_INTERFACE" | grep -q "inet.*$TUN_IP" && \
            ip addr show dev "$TUN_INTERFACE" | grep -q "inet6.*$TUN_IP6"; then
             break
         fi
         sleep 1
-        count=$((count + 1))
+        ((timeout--))
     done
 
-    if [ $count -eq $timeout ]; then
+    if [ "$timeout" -eq 0 ]; then
         warning "Timeout waiting for TUN interface to be fully ready"
     else
         log "TUN interface ready with both IPv4 and IPv6 addresses"
@@ -931,8 +930,8 @@ function check_network_readiness() {
     fi
 
     # Check TUN interface has IPv4 address
-    if ! ip addr show "$TUN_INTERFACE" | grep -q "inet.*$TUN_IP"; then
-        error "TUN interface missing IPv4 address $TUN_IP"
+    if ! ip addr show "$TUN_INTERFACE" | grep -q "inet.*$TUN_PEER_IP"; then
+        error "TUN interface missing IPv4 address $TUN_PEER_IP"
         issues=$((issues + 1))
     else
         log "✓ TUN interface has IPv4 address"
@@ -956,14 +955,14 @@ function check_network_readiness() {
         log "✓ Bypass interface $TUN_BYPASS_INTERFACE is UP"
     fi
 
-    # Check IPv4 default route through TUN
+    # Check IPv4 default route through TUN (Only should be used after psiphon connected)
     if ! ip route show default | grep -q "$TUN_INTERFACE"; then
         warning "No IPv4 default route through $TUN_INTERFACE"
     else
         log "✓ IPv4 default route configured"
     fi
 
-    # Check IPv6 default route through TUN
+    # Check IPv6 default route through TUN (Only should be used after psiphon connected)
     if ! ip -6 route show default | grep -q "$TUN_INTERFACE"; then
         warning "No IPv6 default route through $TUN_INTERFACE"
     else
@@ -990,9 +989,7 @@ function check_network_readiness() {
         log "✓ IPv6 kill switch active"
     fi
 
-    # Note: Connectivity tests are skipped here since Psiphon hasn't started yet
-    log "✓ Network configuration complete (connectivity will be tested after Psiphon starts)"
-
+    log "✓ Network configuration complete"
     if [ $issues -eq 0 ]; then
         success "Network readiness check passed"
         return 0
@@ -1130,7 +1127,7 @@ function diagnose_network_issues() {
 function wait_for_ra_processing() {
     log "Waiting for Router Advertisement processing..."
 
-    local timeout=30
+    local timeout=15
     local count=0
 
     # Wait for any IPv6 changes to settle
@@ -1140,8 +1137,8 @@ function wait_for_ra_processing() {
         current_routes=$(ip -6 route show 2>/dev/null | md5sum)
 
         # Wait a bit
-        sleep 2
-        count=$((count + 2))
+        sleep 1
+        count=$((count + 1))
 
         # Check if routes have stabilized
         local new_routes
@@ -1168,7 +1165,30 @@ function wait_for_ra_processing() {
 }
 
 function setup_tun_routes_after_ra() {
-    log "Setting up TUN routes after RA processing..."
+    log "Setting up TUN default routes after Psiphon connection established..."
+    log "This prevents self-routing by adding routes only after Psiphon binds to bypass interface"
+
+    # Verify Psiphon is actually connected before setting up routes
+    local connection_verified="false"
+    if [[ "$SERVICE_MODE" == "true" ]]; then
+        # Service mode: check journalctl logs
+        if journalctl -u $SERVICE_BINARY_NAME.service -n 10 --no-pager 2>/dev/null | grep -q "ConnectedServerRegion"; then
+            connection_verified="true"
+        fi
+    else
+        # Script mode: check log file
+        if [[ -f "$PSIPHON_LOG_FILE" ]] && tail -n 10 "$PSIPHON_LOG_FILE" 2>/dev/null | grep -q "ConnectedServerRegion"; then
+            connection_verified="true"
+        fi
+    fi
+
+    if [[ "$connection_verified" != "true" ]]; then
+        error "Psiphon connection not verified - refusing to set up default routes"
+        error "This prevents potential self-routing issues"
+        return 1
+    fi
+
+    log "Psiphon connection verified - proceeding with route setup"
 
     # Delete any existing default routes for TUN interface first
     ip route del default dev "$TUN_INTERFACE" 2>/dev/null || true
@@ -1271,7 +1291,7 @@ function setup_tun_routes_after_ra() {
     log "Final IPv6 routes:"
     ip -6 route show | head -5
 
-    success "TUN routes configured after RA processing"
+    success "TUN default routes configured after Psiphon connection established - no self-routing"
 }
 
 # systemd service psiphon binary restart helper
@@ -1281,6 +1301,43 @@ function systemd_psiphon_reload() {
     success "Psiphon binary service reload command issued."
 }
 
+
+# Wait for Psiphon to establish connection
+# Returns 0 on success, 1 on timeout/failure
+function wait_for_psiphon_connection() {
+    local timeout=$1
+    log "Waiting for Psiphon to connect (timeout: ${timeout}s)..."
+
+    while [ "$timeout" -gt 1 ]; do
+        if [[ "$SERVICE_MODE" == "true" ]]; then
+            # Service mode: check systemctl status and journalctl logs
+            if ! systemctl is-active --quiet $SERVICE_BINARY_NAME.service; then
+                error "Psiphon service is not running"
+                return 1
+            fi
+
+            # Check for connection in service logs
+            if journalctl -u $SERVICE_BINARY_NAME.service -n 20 --no-pager 2>/dev/null | grep -q "ConnectedServerRegion"; then
+                log "Psiphon connected successfully"
+                return 0
+            fi
+        else
+            # Script mode: check log file
+            if [[ -f "$PSIPHON_LOG_FILE" ]] && tail -n 5 "$PSIPHON_LOG_FILE" 2>/dev/null | grep -q "ConnectedServerRegion"; then
+                log "Psiphon connected successfully"
+                return 0
+            fi
+        fi
+
+        echo -n "."
+        sleep 1
+        ((timeout--))
+    done
+
+    echo ""
+    error "Timeout waiting for Psiphon connection after ${timeout} seconds"
+    return 1
+}
 
 # Secure Service Initialization
 # Starts Psiphon with security-first approach:
@@ -1329,6 +1386,14 @@ function start_psiphon() {
         done
         log "start the psiphon binary service..."
         systemctl start $SERVICE_BINARY_NAME.service
+
+        # Wait for Psiphon to connect using the helper function
+        if ! wait_for_psiphon_connection 700; then
+            error "Failed to establish Psiphon connection in service mode"
+            log "Check service status with: systemctl status $SERVICE_BINARY_NAME.service"
+            return 1
+        fi
+
         log "Run: systemctl status $SERVICE_BINARY_NAME.service"
         log "   to check the status of the Psiphon binary service."
     else
@@ -1353,15 +1418,11 @@ function start_psiphon() {
             wait_count=$((wait_count + 1))
         done
 
-        # Wait until connected
-        log "waiting psiphon to connect..."
-        until tail -n 5 "$PSIPHON_LOG_FILE" | grep -q "ConnectedServerRegion"
-        do
-            echo -n "."
-            sleep 1
-        done
-
-        echo ""
+        # Wait for connection using the helper function
+        if ! wait_for_psiphon_connection 700; then
+            error "Failed to establish Psiphon connection in script mode"
+            return 1
+        fi
 
         # Open sponsor URL securely
         # We ignore errors here to avoid blocking startup
@@ -1387,14 +1448,14 @@ function start_psiphon() {
         local is_connected=0
         if timeout 10 curl -4s --interface "$TUN_INTERFACE" -m 7 https://youtube.com/generate_204 >/dev/null 2>&1; then
             log "IPv4 Connection verified through tunnel"
-            is_connected++
+            ((is_connected++))
         else
             warning "Could not verify tunnel IPv4 connectivity, but proceeding"
         fi
         sleep 1
         if timeout 10 curl -6s --interface "$TUN_INTERFACE" -m 7 https://youtube.com/generate_204 >/dev/null 2>&1; then
             log "IPv6 Connection verified through tunnel"
-            is_connected++
+            ((is_connected++))
         else
             warning "Could not verify tunnel IPv6 connectivity, but proceeding"
         fi
@@ -2077,9 +2138,9 @@ function main() {
             setup_tun_interface
             setup_routing
             wait_for_ra_processing
+            start_services
             setup_tun_routes_after_ra
             check_network_readiness
-            start_services
             ;;
         systemd_start)
             SERVICE_MODE="true"
@@ -2089,9 +2150,9 @@ function main() {
             setup_tun_interface
             setup_routing
             wait_for_ra_processing
+            start_services
             setup_tun_routes_after_ra
             check_network_readiness
-            start_services
             ;;
         reload)
             check_root
@@ -2119,9 +2180,9 @@ function main() {
             setup_tun_interface
             setup_routing
             wait_for_ra_processing
+            start_services
             setup_tun_routes_after_ra
             check_network_readiness
-            start_services
             ;;
         systemd_restart)
             SERVICE_MODE="true"
@@ -2130,9 +2191,9 @@ function main() {
             setup_tun_interface
             setup_routing
             wait_for_ra_processing
+            start_services
             setup_tun_routes_after_ra
             check_network_readiness
-            start_services
             ;;
         status)
             status
