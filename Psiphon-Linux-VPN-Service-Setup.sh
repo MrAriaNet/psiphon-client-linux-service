@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.2.0"
+readonly INSTALLER_VERSION="1.3.0"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -48,10 +48,17 @@ readonly SERVICE_HOMEPAGE_TRIGGER="psiphon-homepage-trigger"
 readonly TUN_INTERFACE="PsiphonTUN"      # Dedicated TUN interface for isolated traffic
 readonly TUN_SUBNET="10.200.3.0/24"      # IPv4 subnet for tunnel traffic isolation
 readonly TUN_IP="10.200.3.1"             # IPv4 gateway address for tunnel
+readonly TUN_PEER_IP="10.200.3.2"        # IPv4 peer address for point-to-point tunnel
 readonly TUN_SUBNET6="fd42:42:42::/64"   # IPv6 subnet (ULA) for tunnel traffic isolation
 readonly TUN_IP6="fd42:42:42::1"         # IPv6 gateway address for tunnel
 readonly TUN_DNS_SERVERS="8.8.8.8,8.8.4.4" # Google DNS
 readonly TUN_DNS_SERVERS6="2001:4860:4860::8888,2001:4860:4860::8844" # Google DNS IPv6
+
+# WARP Integration Configuration
+readonly WARP_CLI_PATH="/usr/bin/warp-cli"      # Path to WARP CLI executable
+readonly WARP_SVC_PROCESS="warp-svc"            # WARP service process name
+readonly WARP_STATUS_CONNECTED="Status update: Connected"       # Expected WARP status when connected
+readonly WARP_INTERFACE="CloudflareWARP"                  # WARP interface name
 
 # Secure fallback for interface selection: default route with non-loopback fallback
 TUN_BYPASS_INTERFACE=$(ip -json route get 8.8.8.8 2>/dev/null | jq -r '.[0].dev // empty' ||
@@ -612,7 +619,11 @@ function setup_tun_interface() {
 
     # Create TUN interface if it doesn't exist
     if ! ip link show "$TUN_INTERFACE" >/dev/null 2>&1; then
-        ip tuntap add dev "$TUN_INTERFACE" mode tun user "$PSIPHON_USER" group "$PSIPHON_GROUP"
+        if ! ip tuntap add dev "$TUN_INTERFACE" mode tun user "$PSIPHON_USER" group "$PSIPHON_GROUP"; then
+            error "Failed to create TUN interface"
+            cleanup_routing
+            return 1
+        fi
     fi
 
     # Configure IPv4 interface
@@ -620,9 +631,11 @@ function setup_tun_interface() {
         warning "Failed to flush TUN interface: $?"
     fi
 
-    # Configure both IPv4 and IPv6 addresses
-    if ! ip addr add "$TUN_IP/24" dev "$TUN_INTERFACE" metric 50 2>&1; then
-        warning "Failed to add IPv4 address to TUN interface: $?"
+    # Configure IPv4 point-to-point addresses
+    if ! ip addr add "$TUN_IP" peer "$TUN_PEER_IP" dev "$TUN_INTERFACE" 2>&1; then
+        error "Failed to add IPv4 point-to-point address to TUN interface"
+        cleanup_routing
+        return 1
     fi
 
     # Configure IPv6 interface with unique local address
@@ -665,6 +678,14 @@ function setup_tun_interface() {
 function setup_routing() {
     log "Setting up routing and firewall rules..."
 
+
+    # === WARP Integration Check === (WARP is optional)
+    if is_warp_connected; then
+        log "WARP detected and connected via interface: $WARP_INTERFACE"
+        log "Configuring Psiphon → WARP → Internet routing chain"
+        log "May not work very well for now"
+    fi
+
     # === IPv4 Security Configuration ===
     # Enable controlled forwarding for tunnel operations
     # Required for proper VPN functionality while maintaining security
@@ -690,7 +711,11 @@ function setup_routing() {
     # Kill Switch: Block all traffic that is not going through the TUN interface
     log "Implementing IPv4 kill switch..."
     # Set default policy to DROP for output.
-    iptables -P OUTPUT DROP
+    if ! iptables -P OUTPUT DROP 2>&1; then
+        error "Failed to set IPv4 OUTPUT policy to DROP"
+        cleanup_routing
+        return 1
+    fi
 
     # # Allow established and related connections to prevent breaking existing sessions.
     # iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
@@ -706,6 +731,36 @@ function setup_routing() {
     # Allow traffic for the psiphon user to establish the tunnel
     # and ensure it can access network resources
     iptables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
+
+    # TODO: iptables --cmd-owner and --pid-owner are not supported on most of the systems
+    #       so we can't use them for now
+    #
+    # if is_warp_connected && [[ -n "$WARP_INTERFACE" ]]; then
+    #     # Route psiphon-user traffic through WARP interface for chained VPN
+    #     log "Configuring psiphon-user to route through WARP interface"
+    #     iptables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -o "$warp_interface" -j ACCEPT
+    # else
+    #     # Standard direct routing for psiphon-user
+    #     iptables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
+    # fi
+    #
+    # # Allow WARP service to connect if WARP is connected
+    # if is_warp_connected; then
+    #     local warp_pid
+    #     if warp_pid=$(get_warp_svc_pid); then
+    #         log "WARP detected - allowing warp-svc process (PID: $warp_pid) to access internet"
+    #         # Use PID-based rule only (warp-svc runs as root, so can't use UID-based fallback)
+    #         if iptables -A OUTPUT -m owner --pid-owner "$warp_pid" -j ACCEPT 2>/dev/null; then
+    #             log "WARP allowed via PID-based rule"
+    #         else
+    #             warning "Failed to create WARP firewall rule - PID-based rules not supported"
+    #         fi
+    #     else
+    #         warning "WARP status is Connected but warp-svc process not found"
+    #     fi
+    # else
+    #     log "WARP not available - maintaining strict kill switch"
+    # fi
 
     # Allow all traffic going through the TUN interface.
     iptables -A OUTPUT -o "$TUN_INTERFACE" -j ACCEPT
@@ -766,7 +821,11 @@ function setup_ipv6_routing() {
     # Kill Switch: Block all IPv6 traffic that is not going through the TUN interface
     log "Implementing IPv6 kill switch..."
     # Set default policy to DROP for output.
-    ip6tables -P OUTPUT DROP
+    if ! ip6tables -P OUTPUT DROP 2>&1; then
+        error "Failed to set IPv6 OUTPUT policy to DROP"
+        cleanup_routing
+        return 1
+    fi
 
     # # Allow established and related connections.
     # ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
@@ -780,6 +839,36 @@ function setup_ipv6_routing() {
     # Allow traffic for the psiphon user to establish the tunnel
     # and ensure it can access network resources
     ip6tables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
+
+    # TODO: iptables --cmd-owner and --pid-owner are not supported on most of the systems
+    #       so we can't use them for now
+    #
+    # if is_warp_connected && [[ -n "$WARP_INTERFACE" ]]; then
+    #     # Route psiphon-user IPv6 traffic through WARP interface for chained VPN
+    #     log "Configuring psiphon-user IPv6 to route through WARP interface"
+    #     ip6tables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -o "$WARP_INTERFACE" -j ACCEPT
+    # else
+    #     # Standard direct routing for psiphon-user IPv6
+    #     ip6tables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
+    # fi
+    #
+    # # Allow WARP service to connect if WARP is connected (IPv6)
+    # if is_warp_connected; then
+    #     local warp_pid
+    #     if warp_pid=$(get_warp_svc_pid); then
+    #         log "WARP detected - allowing warp-svc process (PID: $warp_pid) to access internet (IPv6)"
+    #         # Use PID-based rule only (warp-svc runs as root, so can't use UID-based fallback)
+    #         if ip6tables -A OUTPUT -m owner --pid-owner "$warp_pid" -j ACCEPT 2>/dev/null; then
+    #             log "WARP IPv6 allowed via PID-based rule"
+    #         else
+    #             warning "Failed to create WARP IPv6 firewall rule - PID-based rules not supported"
+    #         fi
+    #     else
+    #         warning "WARP status is Connected but warp-svc process not found"
+    #     fi
+    # else
+    #     log "WARP not available - maintaining strict IPv6 kill switch"
+    # fi
 
     # Allow all traffic going through the TUN interface.
     ip6tables -A OUTPUT -o "$TUN_INTERFACE" -j ACCEPT
@@ -801,6 +890,241 @@ function setup_ipv6_routing() {
     # ip6tables -t nat -A OUTPUT -p tcp --dport 53 -m owner ! --uid-owner "$PSIPHON_USER" -j DNAT --to-destination "$DNS_SERVER_IP6"
 
     success "IPv6 routing configured"
+}
+
+# Waits for IPv4 routing to stabilize
+function wait_for_ipv4_routing() {
+    log "Waiting for IPv4 routing to stabilize..."
+    local timeout=10
+    local count=0
+
+    while [ $count -lt $timeout ]; do
+        # Check if default route exists through TUN interface with peer gateway
+        if ip route show default | grep -q "via $TUN_PEER_IP dev $TUN_INTERFACE"; then
+            log "IPv4 routing stabilized"
+            return 0
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+
+    warning "IPv4 routing didn't stabilize within $timeout seconds"
+    log "Current IPv4 routes:"
+    ip route show | head -5
+    return 1
+}
+
+# Comprehensive network readiness check
+function check_network_readiness() {
+    log "Performing comprehensive network readiness check..."
+    local issues=0
+
+    # Check TUN interface exists and is UP
+    if ! ip link show "$TUN_INTERFACE" >/dev/null 2>&1; then
+        error "TUN interface $TUN_INTERFACE does not exist"
+        issues=$((issues + 1))
+    elif ! ip link show "$TUN_INTERFACE" | grep -q "UP"; then
+        error "TUN interface $TUN_INTERFACE is not UP"
+        issues=$((issues + 1))
+    else
+        log "✓ TUN interface $TUN_INTERFACE is UP"
+    fi
+
+    # Check TUN interface has IPv4 address
+    if ! ip addr show "$TUN_INTERFACE" | grep -q "inet.*$TUN_IP"; then
+        error "TUN interface missing IPv4 address $TUN_IP"
+        issues=$((issues + 1))
+    else
+        log "✓ TUN interface has IPv4 address"
+    fi
+
+    # Check TUN interface has IPv6 address
+    if ! ip addr show "$TUN_INTERFACE" | grep -q "inet6.*$TUN_IP6"; then
+        warning "TUN interface missing IPv6 address $TUN_IP6"
+    else
+        log "✓ TUN interface has IPv6 address"
+    fi
+
+    # Check bypass interface exists and is UP
+    if ! ip link show "$TUN_BYPASS_INTERFACE" >/dev/null 2>&1; then
+        error "Bypass interface $TUN_BYPASS_INTERFACE does not exist"
+        issues=$((issues + 1))
+    elif ! ip link show "$TUN_BYPASS_INTERFACE" | grep -q "UP"; then
+        error "Bypass interface $TUN_BYPASS_INTERFACE is not UP"
+        issues=$((issues + 1))
+    else
+        log "✓ Bypass interface $TUN_BYPASS_INTERFACE is UP"
+    fi
+
+    # Check IPv4 default route through TUN
+    if ! ip route show default | grep -q "$TUN_INTERFACE"; then
+        warning "No IPv4 default route through $TUN_INTERFACE"
+    else
+        log "✓ IPv4 default route configured"
+    fi
+
+    # Check IPv6 default route through TUN
+    if ! ip -6 route show default | grep -q "$TUN_INTERFACE"; then
+        warning "No IPv6 default route through $TUN_INTERFACE"
+    else
+        log "✓ IPv6 default route configured"
+    fi
+
+    # Check iptables kill switch is active
+    local ipv4_policy
+    ipv4_policy=$(iptables -S | grep "^-P OUTPUT" | awk '{print $3}')
+    if [[ "$ipv4_policy" != "DROP" ]]; then
+        error "IPv4 kill switch (OUTPUT DROP policy) not active (current: ${ipv4_policy:-ACCEPT})"
+        issues=$((issues + 1))
+    else
+        log "✓ IPv4 kill switch active"
+    fi
+
+    # Check ip6tables kill switch is active
+    local ipv6_policy
+    ipv6_policy=$(ip6tables -S | grep "^-P OUTPUT" | awk '{print $3}')
+    if [[ "$ipv6_policy" != "DROP" ]]; then
+        error "IPv6 kill switch (OUTPUT DROP policy) not active (current: ${ipv6_policy:-ACCEPT})"
+        issues=$((issues + 1))
+    else
+        log "✓ IPv6 kill switch active"
+    fi
+
+    # Note: Connectivity tests are skipped here since Psiphon hasn't started yet
+    log "✓ Network configuration complete (connectivity will be tested after Psiphon starts)"
+
+    if [ $issues -eq 0 ]; then
+        success "Network readiness check passed"
+        return 0
+    else
+        error "Network readiness check failed with $issues critical issues"
+        cleanup_routing
+        return 1
+    fi
+}
+
+# Network diagnostic function for troubleshooting
+function diagnose_network_issues() {
+    log "=== Network Diagnostic Report ==="
+    log "Gathering comprehensive network state information..."
+
+    # Basic interface information
+    log ""
+    log "1. Interface Status:"
+    log "TUN Interface ($TUN_INTERFACE):"
+    if ip link show "$TUN_INTERFACE" >/dev/null 2>&1; then
+        ip link show "$TUN_INTERFACE" | sed 's/^/   /'
+        ip addr show "$TUN_INTERFACE" | grep -E "(inet|inet6)" | sed 's/^/   /'
+    else
+        log "   ERROR: TUN interface does not exist"
+    fi
+
+    log ""
+    log "Bypass Interface ($TUN_BYPASS_INTERFACE):"
+    if ip link show "$TUN_BYPASS_INTERFACE" >/dev/null 2>&1; then
+        ip link show "$TUN_BYPASS_INTERFACE" | head -1 | sed 's/^/   /'
+        ip addr show "$TUN_BYPASS_INTERFACE" | grep -E "(inet|inet6)" | head -2 | sed 's/^/   /'
+    else
+        log "   ERROR: Bypass interface does not exist"
+    fi
+
+    # Routing information
+    log ""
+    log "2. Routing Tables:"
+    log "IPv4 Default Routes:"
+    ip route show default | head -5 | sed 's/^/   /' || log "   No IPv4 default routes"
+
+    log "IPv6 Default Routes:"
+    ip -6 route show default | head -5 | sed 's/^/   /' || log "   No IPv6 default routes"
+
+    log "TUN Interface Routes:"
+    ip route show dev "$TUN_INTERFACE" | head -3 | sed 's/^/   /' || log "   No routes via TUN interface"
+
+    # Firewall status
+    log ""
+    log "3. Firewall Status:"
+    log "IPv4 iptables OUTPUT policy:"
+    iptables-save
+
+    log "IPv6 ip6tables OUTPUT policy:"
+    ip6tables-save
+
+    # Process status
+    log ""
+    log "4. Process Status:"
+    if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+        local pids
+        pids=$(pgrep -f "psiphon-tunnel-core")
+        log "Psiphon processes: $pids"
+        for pid in $pids; do
+            if ps -p "$pid" -o pid,ppid,user,args --no-headers 2>/dev/null; then
+                ps -p "$pid" -o pid,ppid,user,args --no-headers | sed 's/^/   /'
+            fi
+        done
+    else
+        log "   No Psiphon processes found"
+    fi
+
+    # DNS configuration
+    log ""
+    log "5. DNS Configuration:"
+    if [[ -f /etc/resolv.conf ]]; then
+        log "Current resolv.conf:"
+        head -5 /etc/resolv.conf | sed 's/^/   /'
+    fi
+
+    # Connectivity tests
+    log ""
+    log "6. Connectivity Tests:"
+
+    # Test IPv4 connectivity through TUN (only if Psiphon is running)
+    log "IPv4 connectivity test through TUN (HTTP):"
+    if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+        if timeout 8 curl -4 -s --interface "$TUN_INTERFACE" --connect-timeout 5 -o /dev/null http://www.google.com/generate_204 2>/dev/null; then
+            log "   ✓ IPv4 HTTP through TUN successful"
+        else
+            log "   ✗ IPv4 HTTP through TUN failed"
+        fi
+    else
+        log "   - Psiphon not running, skipping connectivity test"
+    fi
+
+    # Test IPv6 connectivity through TUN (only if Psiphon is running)
+    log "IPv6 connectivity test through TUN (HTTP):"
+    if pgrep -f "psiphon-tunnel-core" >/dev/null 2>&1; then
+        if timeout 8 curl -6 -s --interface "$TUN_INTERFACE" --connect-timeout 5 -o /dev/null http://www.google.com/generate_204 2>/dev/null; then
+            log "   ✓ IPv6 HTTP through TUN successful"
+        else
+            log "   ✗ IPv6 HTTP through TUN failed"
+        fi
+    else
+        log "   - Psiphon not running, skipping connectivity test"
+    fi
+
+    # System information
+    log ""
+    log "7. System Information:"
+    log "Kernel version: $(uname -r)"
+    log "Available network namespaces: $(ip netns list 2>/dev/null | wc -l)"
+
+    # Check for conflicting services
+    log ""
+    log "8. Potential Conflicts:"
+    if systemctl is-active NetworkManager >/dev/null 2>&1; then
+        log "   WARNING: NetworkManager is active (may interfere)"
+    fi
+
+    if systemctl is-active systemd-networkd >/dev/null 2>&1; then
+        log "   INFO: systemd-networkd is active"
+    fi
+
+    if pgrep -f "warp-svc" >/dev/null 2>&1; then
+        log "   INFO: WARP service detected"
+    fi
+
+    log ""
+    log "=== End Diagnostic Report ==="
+    success "Network diagnostic complete - review output above for issues"
 }
 
 function wait_for_ra_processing() {
@@ -850,47 +1174,102 @@ function setup_tun_routes_after_ra() {
     ip route del default dev "$TUN_INTERFACE" 2>/dev/null || true
     ip -6 route del default dev "$TUN_INTERFACE" 2>/dev/null || true
 
-    # Set up IPv4 routing
-    if ! ip route add default dev "$TUN_INTERFACE" metric 50 2>&1; then
-        error "Failed to add IPv4 default route to TUN table: $?"
-        ip route show
-        return 1
+    # Add explicit route for TUN subnet if needed
+    if ! ip route show | grep -q "$TUN_SUBNET.*$TUN_INTERFACE"; then
+        log "Adding TUN subnet route..."
+        ip route add "$TUN_SUBNET" dev "$TUN_INTERFACE" 2>/dev/null || true
     fi
 
-    # Verify IPv4 routing is working
+    # Set up IPv4 routing with retry logic
+    log "Setting up IPv4 default route..."
     local retry_count=0
+    local ipv4_success=false
+
     while [ $retry_count -lt 3 ]; do
-        if ip route show default | grep -q "$TUN_INTERFACE"; then
-            log "IPv4 routing verified"
+        if ip route add default via "$TUN_PEER_IP" dev "$TUN_INTERFACE" metric 50 2>/dev/null; then
+            log "IPv4 default route added successfully via $TUN_PEER_IP"
+            ipv4_success=true
             break
+        else
+            warning "Failed to add IPv4 default route, attempt $((retry_count + 1))/3"
+            # Clean up any partial routes
+            ip route del default via "$TUN_PEER_IP" dev "$TUN_INTERFACE" 2>/dev/null || true
+            sleep 2
+            retry_count=$((retry_count + 1))
         fi
-        sleep 1
-        retry_count=$((retry_count + 1))
     done
 
-    # Set up IPv6 routing
-    if ! ip -6 route add default dev "$TUN_INTERFACE" metric 50 pref high 2>&1; then
-        error "Failed to add IPv6 default route to TUN table: $?"
-        ip -6 route show
+    if [ "$ipv4_success" = false ]; then
+        error "Failed to establish IPv4 default route after 3 attempts"
+        log "Current IPv4 routes:"
+        ip route show
+        cleanup_routing
         return 1
     fi
 
-    # Verify IPv6 routing is working
+    # Wait for IPv4 routing to stabilize
+    if ! wait_for_ipv4_routing; then
+        warning "IPv4 routing stabilization check failed, but continuing"
+    fi
+
+    # Set up IPv6 routing with retry logic
+    log "Setting up IPv6 default route..."
     retry_count=0
+    local ipv6_success=false
+
     while [ $retry_count -lt 3 ]; do
+        if ip -6 route add default dev "$TUN_INTERFACE" metric 50 pref high 2>/dev/null; then
+            log "IPv6 default route added successfully"
+            ipv6_success=true
+            break
+        else
+            warning "Failed to add IPv6 default route, attempt $((retry_count + 1))/3"
+            # Clean up any partial routes
+            ip -6 route del default dev "$TUN_INTERFACE" 2>/dev/null || true
+            sleep 2
+            retry_count=$((retry_count + 1))
+        fi
+    done
+
+    if [ "$ipv6_success" = false ]; then
+        warning "Failed to establish IPv6 default route after 3 attempts"
+        log "Current IPv6 routes:"
+        ip -6 route show | head -10
+    fi
+
+    # Verify both routing tables are working
+    local final_check_count=0
+    while [ $final_check_count -lt 5 ]; do
+        local ipv4_route_ok=false
+        local ipv6_route_ok=false
+
+        if ip route show default | grep -q "via $TUN_PEER_IP dev $TUN_INTERFACE"; then
+            ipv4_route_ok=true
+        fi
+
         if ip -6 route show default | grep -q "$TUN_INTERFACE"; then
-            log "IPv6 routing verified"
+            ipv6_route_ok=true
+        fi
+
+        if [ "$ipv4_route_ok" = true ] || [ "$ipv6_route_ok" = true ]; then
+            if [ "$ipv4_route_ok" = true ]; then
+                log "IPv4 routing verified"
+            fi
+            if [ "$ipv6_route_ok" = true ]; then
+                log "IPv6 routing verified"
+            fi
             break
         fi
+
         sleep 1
-        retry_count=$((retry_count + 1))
+        final_check_count=$((final_check_count + 1))
     done
 
     # Show routing table for debugging
     log "Final IPv4 routes:"
-    ip route show
+    ip route show | head -5
     log "Final IPv6 routes:"
-    ip -6 route show
+    ip -6 route show | head -5
 
     success "TUN routes configured after RA processing"
 }
@@ -931,13 +1310,23 @@ function start_psiphon() {
 
     # Kill any existing Psiphon processes
     pkill -f "psiphon-tunnel-core.*$TUN_INTERFACE" 2>/dev/null || true
-    sleep 2
+    # Wait for processes to actually terminate
+    local wait_count=0
+    while pgrep -f "psiphon-tunnel-core.*$TUN_INTERFACE" >/dev/null 2>&1 && [ $wait_count -lt 10 ]; do
+        sleep 1
+        wait_count=$((wait_count + 1))
+    done
 
     # In service mode, run as a systemd service
     if [[ "$SERVICE_MODE" == "true" ]]; then
         log "start the homepage monitor service..."
         systemctl start $SERVICE_HOMEPAGE_MONITOR.path
-        sleep 1
+        # Wait for service to be active
+        local wait_count=0
+        while [ "$(systemctl is-active $SERVICE_HOMEPAGE_MONITOR.path 2>/dev/null)" != "active" ] && [ $wait_count -lt 10 ]; do
+            sleep 1
+            wait_count=$((wait_count + 1))
+        done
         log "start the psiphon binary service..."
         systemctl start $SERVICE_BINARY_NAME.service
         log "Run: systemctl status $SERVICE_BINARY_NAME.service"
@@ -957,7 +1346,12 @@ function start_psiphon() {
 
         local psiphon_pid=$!
 
-        sleep 1
+        # Wait for process to initialize
+        local wait_count=0
+        while ! kill -0 "$psiphon_pid" 2>/dev/null && [ $wait_count -lt 10 ]; do
+            sleep 1
+            wait_count=$((wait_count + 1))
+        done
 
         # Wait until connected
         log "waiting psiphon to connect..."
@@ -987,8 +1381,27 @@ function start_psiphon() {
         chown root:root $PID_FILE
         chmod 644 $PID_FILE
 
-        # Give it time to establish connection
-        sleep 5
+        # Test if connection is actually working
+        log "Verifying tunnel connectivity..."
+        sleep 2
+        local is_connected=0
+        if timeout 10 curl -4s --interface "$TUN_INTERFACE" -m 7 https://youtube.com/generate_204 >/dev/null 2>&1; then
+            log "IPv4 Connection verified through tunnel"
+            is_connected++
+        else
+            warning "Could not verify tunnel IPv4 connectivity, but proceeding"
+        fi
+        sleep 1
+        if timeout 10 curl -6s --interface "$TUN_INTERFACE" -m 7 https://youtube.com/generate_204 >/dev/null 2>&1; then
+            log "IPv6 Connection verified through tunnel"
+            is_connected++
+        else
+            warning "Could not verify tunnel IPv6 connectivity, but proceeding"
+        fi
+
+        if [[ $is_connected < 2 ]]; then
+            warning "Consider the script manually!"
+        fi
 
         # Final verification
         if ! kill -0 "$psiphon_pid" 2>/dev/null; then
@@ -1090,6 +1503,7 @@ function start_services() {
         success "Psiphon TUN service started successfully"
     else
         error "Failed to start services"
+        stop_services
         return 1
     fi
 }
@@ -1110,6 +1524,7 @@ function cleanup_routing() {
     ip6tables -t nat -F 2>/dev/null || true
 
     # The default routes are removed when the TUN interface is deleted, but we can be explicit.
+    ip route del default via "$TUN_PEER_IP" dev "$TUN_INTERFACE" 2>/dev/null || true
     ip route del default dev "$TUN_INTERFACE" 2>/dev/null || true
     ip -6 route del default dev "$TUN_INTERFACE" 2>/dev/null || true
 
@@ -1156,7 +1571,12 @@ function stop_services() {
         if [[ -n "$psiphon_pid" ]] && kill -0 "$psiphon_pid" 2>/dev/null; then
             # Try graceful shutdown first
             kill -TERM "$psiphon_pid" 2>/dev/null || true
-            sleep 3
+            # Wait for graceful termination
+            local wait_count=0
+            while kill -0 "$psiphon_pid" 2>/dev/null && [ $wait_count -lt 7 ]; do
+                sleep 1
+                wait_count=$((wait_count + 1))
+            done
             # Force kill if still running
             if kill -0 "$psiphon_pid" 2>/dev/null; then
                 kill -KILL "$psiphon_pid" 2>/dev/null || true
@@ -1194,6 +1614,13 @@ function stop_services() {
         ip link delete "$TUN_INTERFACE" 2>/dev/null || true
         stopped_something=true
     fi
+
+    # Wait for services to actually stop
+    local wait_count=0
+    while (systemctl is-active $SERVICE_BINARY_NAME.service >/dev/null 2>&1 || systemctl is-active $SERVICE_HOMEPAGE_MONITOR.path >/dev/null 2>&1) && [ $wait_count -lt 7 ]; do
+        sleep 1
+        wait_count=$((wait_count + 1))
+    done
 
     if $stopped_something; then
         success "Services stopped successfully"
@@ -1281,7 +1708,134 @@ function uninstall() {
     success "Psiphon TUN setup uninstalled"
 }
 
-# Show status
+# Get WARP status
+function get_warp_status() {
+    ACTIVE_USER=$(logname)
+    local status_output
+    if [[ -x "$WARP_CLI_PATH" ]]; then
+        status_output=$(exec runuser -u "$ACTIVE_USER" -- "$WARP_CLI_PATH" status 2>/dev/null || echo "ERROR")
+        echo "$status_output"
+    else
+        echo "ERROR"
+    fi
+}
+
+# Check if WARP is available and connected
+function is_warp_connected() {
+    [[ "$(get_warp_status)" == *"$WARP_STATUS_CONNECTED"* ]]
+}
+
+function get_warp_svc_pid() {
+    # Get the PID of the warp-svc process - try multiple methods for reliability
+    local warp_pid
+
+    # Method 1: pgrep exact match
+    warp_pid=$(pgrep -x "$WARP_SVC_PROCESS" 2>/dev/null | head -n1)
+
+    # Method 2: fallback to pgrep with partial match
+    if [[ -z "$warp_pid" ]]; then
+        warp_pid=$(pgrep -f "$WARP_SVC_PROCESS" 2>/dev/null | head -n1)
+    fi
+
+    # Method 3: fallback to ps grep
+    if [[ -z "$warp_pid" ]]; then
+        warp_pid=$(ps aux | grep -v grep | grep "$WARP_SVC_PROCESS" | awk '{print $2}' | head -n1)
+    fi
+
+    if [[ -n "$warp_pid" ]]; then
+        echo "$warp_pid"
+        return 0
+    else
+        return 1
+    fi
+}
+
+function warp_status() {
+    echo "=== WARP Integration Status ==="
+
+    local proxyonly_over_warp="false"
+    local psiphontunv4
+    # Check WARP CLI availability
+    if [[ -x "$WARP_CLI_PATH" ]]; then
+        echo -e "WARP CLI: ${GREEN}Available${NC} ($WARP_CLI_PATH)"
+
+        # Get WARP status
+        local warp_status_output
+        warp_status_output=$(get_warp_status)
+        echo "WARP CLI Output: $warp_status_output"
+
+        # Check connection status
+        if is_warp_connected; then
+            echo -e "WARP Status: ${GREEN}Connected${NC}"
+            echo -e "WARP Interface: $WARP_INTERFACE"
+            # Check WARP service process
+            local warp_pid
+            if warp_pid=$(get_warp_svc_pid); then
+                echo -e "WARP Service: ${GREEN}Running${NC} (PID: $warp_pid)"
+                echo -e "WARP Process: $WARP_SVC_PROCESS"
+                echo -e "WARP User: root (warp-svc always runs as root)"
+
+                # Check firewall rules for WARP
+                echo ""
+                echo "=== Firewall Configuration ==="
+                echo "IPv4 rules for WARP process (PID: $warp_pid):"
+                iptables -L OUTPUT -v -n | grep "$warp_pid" || echo "No PID-specific rules found"
+
+                echo ""
+                echo "IPv6 rules for WARP process (PID: $warp_pid):"
+                ip6tables -L OUTPUT -v -n | grep "$warp_pid" || echo "No PID-specific rules found"
+
+            else
+                echo -e "WARP Service: ${RED}Process Not Found${NC}"
+            fi
+
+            # Test WARP connectivity
+            echo ""
+            echo "=== WARP Connectivity Test ==="
+            # Try to detect if traffic is going through WARP
+            local cdncgitracev4
+            if cdncgitracev4=$(timeout 10 curl -4sSm 7 --interface $WARP_INTERFACE https://cloudflare.com/cdn-cgi/trace 2>/dev/null); then
+                echo -e "WARP IPv4 Result: $(echo "$cdncgitracev4" | grep 'warp=')"
+            else
+                echo -e "WARP IPv4 Test: ${RED}FAILED${NC}"
+            fi
+            local cdncgitracev6
+            if cdncgitracev6=$(timeout 10 curl -6sSm 7 --interface $WARP_INTERFACE https://cloudflare.com/cdn-cgi/trace 2>/dev/null); then
+                echo -e "WARP IPv6 Result: $(echo "$cdncgitracev6" | grep 'warp=')"
+            else
+                echo -e "WARP IPv6 Test: ${RED}FAILED${NC}"
+            fi
+
+            # Check if psiphon process is active and has a connection to the internet
+            local psiphonipv4
+            psiphonipv4=$(timeout 10 curl -4sSm 7 -x socks5://127.0.0.1:$SOCKS_PORT https://cloudflare.com/cdn-cgi/trace)
+
+            # Check for active psiphon TUN interface
+            if psiphontunv4=$(ip addr show dev $TUN_INTERFACE | grep -o 'inet [0-9.]*' | cut -d' ' -f2); then
+                echo -e "Psiphon TUN IPv4: ${GREEN}$psiphontunv4${NC}"
+                echo -e "• Traffic Flow: ${GREEN}All applications → PsiphonTUN → Psiphon Process → WARP → Internet${NC}"
+                echo "• Kill Switch: All traffic blocked by default (OUTPUT DROP)"
+                echo -e "• Whitelisted: $PSIPHON_USER (for tunnel establishment)"
+                # echo "• Whitelisted: $WARP_SVC_PROCESS PID (for WARP connectivity)"
+            else
+                if [[ $(echo "$cdncgitracev4" | grep 'warp=') == "warp=on" && $(echo "$psiphonipv4" | grep 'warp=') == "warp=off" ]]; then
+                    echo -e "Psiphon running only as a proxy over WARP: ${GREEN}OK${NC}"
+                    echo -e "• Traffic Flow 1: ${GREEN}Applications with proxy → Psiphon Process → WARP → Internet${NC}"
+                    echo -e "• Traffic Flow 2: ${YELLOW}All other applications without proxy → WARP → Internet${NC}"
+                elif  [[ $(echo "$cdncgitracev4" | grep 'warp=') == "warp=on" ]]; then
+                    echo -e "• Traffic Flow: ${GREEN}Applications → WARP → Internet${NC}"
+                fi
+            fi
+        else
+            echo ""
+            echo -e "=== WARP Status: ${RED}Not Connected${NC} ==="
+        fi
+
+    else
+        echo -e "WARP CLI: ${RED}Not Available${NC} ($WARP_CLI_PATH)"
+    fi
+}
+
 function status() {
     echo "=== Psiphon TUN Status ==="
 
@@ -1336,6 +1890,8 @@ function status() {
             fi
         else
             echo -e "Connection Test: ${RED}FAILED${NC}"
+            echo ""
+            echo -e "${YELLOW}Connection test failed. Run 'sudo $0 diagnose' for detailed network diagnostics.${NC}"
         fi
     fi
 
@@ -1356,6 +1912,7 @@ function status() {
         # fi
     else
         echo -e "IPv6 Support: ${RED}NOT CONFIGURED${NC}"
+        echo -e "${YELLOW}IPv6 not configured. Run 'sudo $0 diagnose' for detailed analysis.${NC}"
     fi
 
     echo ""
@@ -1363,12 +1920,36 @@ function status() {
     echo -e "DNS v4 Query Result: $(dig -4 +timeout=2 +retry=0 +short youtube.com @8.8.8.8 | head -n1)"
     echo -e "DNS v6 Query Result: $(dig -6 +timeout=2 +retry=0 +short youtube.com @2001:4860:4860::8888 | head -n1)"
 
+    # WARP Status
+    echo ""
+    echo "=== WARP Integration Status ==="
+    if [[ -x "$WARP_CLI_PATH" ]]; then
+        if is_warp_connected; then
+            echo -e "WARP Status: ${GREEN}Connected${NC}"
+            if warp_pid=$(get_warp_svc_pid); then
+                echo -e "WARP Service: ${GREEN}Running${NC} (PID: $warp_pid)"
+            fi
+        else
+            echo -e "WARP Status: Not Connected"
+            echo -e "VPN Mode: Psiphon Only"
+        fi
+    else
+        echo -e "WARP CLI: ${RED}Not Installed${NC} ($WARP_CLI_PATH)"
+        echo -e "VPN Mode: Psiphon Only"
+    fi
+
     echo ""
     echo "=== curl test ==="
     echo -e "External IPv4 direct:\n$(timeout 10 curl -4sSm 7 https://cloudflare.com/cdn-cgi/trace)"
     echo ""
     sleep 1
     echo -e "External IPv6 direct:\n$(timeout 10 curl -6sSm 7 https://cloudflare.com/cdn-cgi/trace)"
+    echo ""
+    sleep 1
+    echo -e "External IPv4 SOCKS port:\n$(timeout 10 curl -4sSm 7 -x socks5://127.0.0.1:$SOCKS_PORT https://cloudflare.com/cdn-cgi/trace)"
+    echo ""
+    sleep 1
+    echo -e "External IPv6 SOCKS port:\n$(timeout 10 curl -6sSm 7 -x socks5://[::ffff:127.0.0.1]:$SOCKS_PORT https://cloudflare.com/cdn-cgi/trace)"
     echo ""
 }
 
@@ -1428,6 +2009,8 @@ COMMANDS:
     stop        Stop Psiphon service and cleanup
     restart     Stop and restart Psiphon service
     status      Show status of all components
+    diagnose    Run comprehensive network diagnostics for troubleshooting
+    warp-status Check WARP integration status and configuration
     update      Check for and install Psiphon updates
     help        Show this help message
 
@@ -1450,6 +2033,11 @@ NETWORK CONFIGURATION:
     • SOCKS Proxy: 127.0.0.1:$SOCKS_PORT
     • HTTP Proxy: 127.0.0.1:$HTTP_PORT
     • Traffic routing excludes Psiphon user to prevent loops
+
+WARP INTEGRATION:
+    • Auto-detects if WARP is connected (warp-cli status = Connected)
+    • Creates VPN chain: Psiphon → WARP → Internet (may not work very well for now)
+    • Use 'warp-status' command for detailed WARP integration info
 
 FILES:
     • Install Directory: $INSTALL_DIR
@@ -1496,6 +2084,7 @@ function main() {
             setup_routing
             wait_for_ra_processing
             setup_tun_routes_after_ra
+            check_network_readiness
             start_services
             ;;
         systemd_start)
@@ -1507,6 +2096,7 @@ function main() {
             setup_routing
             wait_for_ra_processing
             setup_tun_routes_after_ra
+            check_network_readiness
             start_services
             ;;
         reload)
@@ -1532,26 +2122,33 @@ function main() {
             check_root
             acquire_lock
             stop_services
-            sleep 3
             setup_tun_interface
             setup_routing
             wait_for_ra_processing
             setup_tun_routes_after_ra
+            check_network_readiness
             start_services
             ;;
         systemd_restart)
             SERVICE_MODE="true"
             check_root
             stop_services
-            sleep 3
             setup_tun_interface
             setup_routing
             wait_for_ra_processing
             setup_tun_routes_after_ra
+            check_network_readiness
             start_services
             ;;
         status)
             status
+            ;;
+        diagnose)
+            check_root
+            diagnose_network_issues
+            ;;
+        warp-status)
+            warp_status
             ;;
         update)
             check_root
