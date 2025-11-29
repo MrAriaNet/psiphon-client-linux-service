@@ -20,7 +20,7 @@ System-wide Psiphon VPN service for Linux with absolute kill-switch protection. 
 
 - Linux with systemd (only if you want to use it)
 - Root access
-- iptables/ip6tables
+- nftables
 
 ## 🚀 Installation
 
