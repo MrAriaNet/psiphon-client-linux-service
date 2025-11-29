@@ -880,9 +880,9 @@ EOF
         done
         # Also log the generated ruleset for debugging
         error "Generated ruleset that failed validation:"
-        cat "$nft_ruleset_file" | while read -r line; do
+        while read -r line; do
             error "  $line"
-        done
+        done < "$nft_ruleset_file"
         return 1
     fi
     
@@ -901,9 +901,9 @@ EOF
             error "  $line"
         done
         error "Generated ruleset that failed application:"
-        cat "$nft_ruleset_file" | while read -r line; do
+        while read -r line; do
             error "  $line"
-        done
+        done < "$nft_ruleset_file"
         return 1
     fi
     
