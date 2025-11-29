@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.3.2"
+readonly INSTALLER_VERSION="1.4.0"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -151,7 +151,7 @@ function acquire_lock() {
 function check_dependencies() {
     local missing_tools=()
 
-    for tool in wget curl unzip ip iptables ip6tables; do
+    for tool in wget curl unzip ip nft; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
         fi
@@ -161,11 +161,38 @@ function check_dependencies() {
         error "Missing required tools: ${missing_tools[*]}"
         log "Installing missing tools..."
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update && apt-get install -y "${missing_tools[@]}"
+            # On Debian/Ubuntu, nft comes from the nftables package
+            local packages_to_install=()
+            for tool in "${missing_tools[@]}"; do
+                if [ "$tool" = "nft" ]; then
+                    packages_to_install+=("nftables")
+                else
+                    packages_to_install+=("$tool")
+                fi
+            done
+            apt-get update && apt-get install -y "${packages_to_install[@]}"
         elif command -v yum >/dev/null 2>&1; then
-            yum install -y "${missing_tools[@]}"
+            # On RHEL/CentOS/Fedora
+            local packages_to_install=()
+            for tool in "${missing_tools[@]}"; do
+                if [ "$tool" = "nft" ]; then
+                    packages_to_install+=("nftables")
+                else
+                    packages_to_install+=("$tool")
+                fi
+            done
+            yum install -y "${packages_to_install[@]}"
         elif command -v pacman >/dev/null 2>&1; then
-            pacman -S --noconfirm "${missing_tools[@]}"
+            # On Arch Linux
+            local packages_to_install=()
+            for tool in "${missing_tools[@]}"; do
+                if [ "$tool" = "nft" ]; then
+                    packages_to_install+=("nftables")
+                else
+                    packages_to_install+=("$tool")
+                fi
+            done
+            pacman -S --noconfirm "${packages_to_install[@]}"
         else
             error "Cannot install missing tools. Please install manually: ${missing_tools[*]}"
             exit 1
@@ -479,26 +506,29 @@ StartLimitBurst=3
 [Service]
 Type=exec
 # ExecStartPre=/bin/sleep 2
-ExecStart=$PSIPHON_BINARY -config $PSIPHON_CONFIG_FILE -dataRootDirectory $INSTALL_DIR/data \\
-    -tunDevice $TUN_INTERFACE -tunBindInterface $TUN_BYPASS_INTERFACE \\
-    -tunDNSServers $TUN_DNS_SERVERS,$TUN_DNS_SERVERS6 -formatNotices -useNoticeFiles
+ExecStart="$PSIPHON_BINARY" -config "$PSIPHON_CONFIG_FILE" -dataRootDirectory "$INSTALL_DIR/data" \\
+    -tunDevice "$TUN_INTERFACE" -tunBindInterface "$TUN_BYPASS_INTERFACE" \\
+    -tunDNSServers "$TUN_DNS_SERVERS,$TUN_DNS_SERVERS6" -formatNotices -useNoticeFiles
 # ExecStop=/bin/kill -TERM \$MAINPID
 # ExecReload=/bin/systemctl --no-block restart %n
 User=$PSIPHON_USER
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=$SERVICE_BINARY_NAME
 Restart=always
 RestartSec=7s
 
 # Security settings
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$INSTALL_DIR
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+ReadWritePaths=$INSTALL_DIR /var/log
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_RESOURCE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 SecureBits=noroot-locked
+ProtectClock=no
+ProtectControlGroups=no
 
 [Install]
 WantedBy=multi-user.target
@@ -533,7 +563,7 @@ Requires=graphical.target
 Type=oneshot
 Environment="DISPLAY=:0"
 Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$ACTIVE_USER_ID/bus"
-ExecStart=notify-send -a "$SERVICE_CONFIGURE_NAME" -u critical -i applications-internet -t 15000 "Psiphon connectivity has changed!" "run: 'systemctl status $SERVICE_BINARY_NAME' to check connection status"
+ExecStart=/bin/sh -c 'journalctl -u psiphon-binary -n 5 --no-pager 2>/dev/null | grep -q "Tunnels.*count.*1" && notify-send -a "$SERVICE_CONFIGURE_NAME" -u critical -i network-vpn -t 10000 "Psiphon Connected" || notify-send -a "$SERVICE_CONFIGURE_NAME" -u normal -i network-vpn-disconnected -t 10000 "Psiphon Status Changed" "run: systemctl status psiphon-binary to check connection status"'
 User=$ACTIVE_USER
 
 # TODO: Make this open the URL in the user's default browser **securely**
@@ -586,12 +616,11 @@ EOF
     # done
 
     else
+        # Create resolved.conf drop-in directory if it doesn't exist
+        mkdir -p /etc/systemd/resolved.conf.d/
 
-        if [ -f /etc/systemd/resolved.conf.d/psiphon-tun.conf ]; then
-
-            # Create resolved.conf drop-in directory if it doesn't exist
-            mkdir -p /etc/systemd/resolved.conf.d/
-
+        # Create custom configuration for DNS if it doesn't already exist
+        if [ ! -f /etc/systemd/resolved.conf.d/psiphon-tun.conf ]; then
             # Create custom configuration for DNS
             cat > /etc/systemd/resolved.conf.d/psiphon-tun.conf <<EOF
 [Resolve]
@@ -616,6 +645,31 @@ EOF
 # Setup TUN interface
 function setup_tun_interface() {
     log "Setting up TUN interface..."
+
+    # # DYNAMIC INTERFACE DETECTION: Re-determine bypass interface if not set or in service mode
+    # # In systemd service mode, the network may not have been ready when the script loaded,
+    # # so we need to re-detect the bypass interface now
+    # if [[ -z "$TUN_BYPASS_INTERFACE" ]] || [[ "$SERVICE_MODE" == "true" ]]; then
+    #     log "Re-detecting bypass interface for current network state..."
+    #     local detected_interface
+    #     detected_interface=$(ip -json route get 8.8.8.8 2>/dev/null | jq -r '.[0].dev // empty' ||
+    #                                ip -json link show | jq -r '.[] | select(.link_type!="loopback") | .ifname' | head -n1)
+        
+    #     if [[ -n "$detected_interface" ]]; then
+    #         if [[ "$TUN_BYPASS_INTERFACE" != "$detected_interface" ]]; then
+    #             log "Bypass interface changed from '$TUN_BYPASS_INTERFACE' to '$detected_interface'"
+    #         fi
+    #         TUN_BYPASS_INTERFACE="$detected_interface"
+    #     elif [[ -z "$TUN_BYPASS_INTERFACE" ]]; then
+    #         error "Could not determine bypass interface - network may not be ready"
+    #         error "Initial detection also failed. Check network connectivity."
+    #         return 1
+    #     else
+    #         log "Using previously detected bypass interface: $TUN_BYPASS_INTERFACE"
+    #     fi
+    # fi
+
+    # log "Using bypass interface: $TUN_BYPASS_INTERFACE"
 
     # Create TUN interface if it doesn't exist
     if ! ip link show "$TUN_INTERFACE" >/dev/null 2>&1; then
@@ -663,20 +717,295 @@ function setup_tun_interface() {
         log "TUN interface ready with both IPv4 and IPv6 addresses"
     fi
 
+    # Verify psiphon-user can access TUN device before proceeding
+    # This prevents silent failures when Psiphon later tries to bind to the TUN interface
+    log "Verifying psiphon-user access to TUN device..."
+    if ! sudo -u "$PSIPHON_USER" test -r "/dev/net/tun" 2>/dev/null || \
+       ! sudo -u "$PSIPHON_USER" test -w "/dev/net/tun" 2>/dev/null; then
+        error "User $PSIPHON_USER cannot read/write /dev/net/tun device"
+        error "Check TUN interface permissions and group membership"
+        cleanup_routing
+        return 1
+    fi
+    log "✓ TUN device access verified for psiphon-user"
+
     # DON'T add default routes here - wait for RA processing
     log "TUN interface configured (routes will be added after RA processing)"
 
     # Update DNS configuration after routes are established
     change_dns_config
 
+    # Verify DNS system is ready before proceeding
+    # systemd-resolved may need time to reload configuration
+    log "Waiting for DNS system to stabilize..."
+    local dns_wait=0
+    local dns_max_wait=10
+    while [ $dns_wait -lt $dns_max_wait ]; do
+        if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+            log "✓ systemd-resolved is active"
+            break
+        fi
+        sleep 1
+        dns_wait=$((dns_wait + 1))
+    done
+
+    if [ $dns_wait -eq $dns_max_wait ]; then
+        warning "systemd-resolved not confirmed active after ${dns_max_wait}s, but proceeding"
+    fi
+
     success "TUN interface configured with IPv4 and IPv6 addresses"
 }
 
 # Network Security and Kill Switch Implementation
-# Configures comprehensive traffic isolation and routing enforcement
+# Configures comprehensive traffic isolation and routing enforcement using nftables
+# Configure nftables firewall rules for secure VPN operation
+configure_nftables() {
+    local tun_interface="$TUN_INTERFACE"
+    local tun_subnet="$TUN_SUBNET"
+    local tun_subnet6="$TUN_SUBNET6"
+    local bypass_interface="$TUN_BYPASS_INTERFACE"
+    
+    # Get the numeric UID for psiphon-user (required for nftables meta skuid)
+    local psiphon_uid
+    psiphon_uid=$(id -u "$PSIPHON_USER" 2>/dev/null)
+    if [ -z "$psiphon_uid" ]; then
+        error "Failed to get UID for $PSIPHON_USER"
+        return 1
+    fi
+    
+    # Check if nftables is available and working
+    if ! command -v nft &>/dev/null; then
+        error "nftables (nft command) is not available. Please install the nftables package."
+        return 1
+    fi
+    
+    # Verify nftables can be used (test with a simple list command)
+    local nft_test
+    if ! nft_test=$(nft list tables 2>&1 >/dev/null); then
+        error "nftables command failed. This may indicate:"
+        error "  1. nftables service is not running (try: systemctl start nftables)"
+        error "  2. Missing kernel support for nftables"
+        error "  3. Permission issues (this should be run as root)"
+        error "  Raw error: $nft_test"
+        return 1
+    fi
+    
+    log "Configuring nftables with UID $psiphon_uid for $PSIPHON_USER"
+    
+    # Create a temporary file to build the nftables ruleset
+    # This ensures safe configuration before applying
+    local nft_ruleset_file
+    nft_ruleset_file=$(mktemp) || {
+        error "Failed to create temporary file for nftables configuration"
+        return 1
+    }
+
+    # shellcheck disable=SC2064
+    # Double quotes intentionally used here to capture the local variable value
+    # while the function is still executing. Single quotes would cause the
+    # variable to be undefined when the trap fires (out of scope).
+    trap "rm -f '$nft_ruleset_file'" RETURN
+    
+    # Generate the nftables ruleset with proper variable expansion
+    cat > "$nft_ruleset_file" << EOF
+# Clear any existing rules but maintain structure
+flush ruleset
+
+# Define filter table (inet covers both IPv4 and IPv6)
+table inet psiphon_filter {
+    chain input {
+        type filter hook input priority 0; policy accept;
+    }
+    
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        
+        # Allow established/related connections first
+        ct state {established, related} accept
+        
+        # Allow traffic through TUN interface (both directions)
+        iifname "$tun_interface" accept
+        oifname "$tun_interface" accept
+    }
+    
+    chain output {
+        type filter hook output priority 0; policy drop;
+        
+        # Allow loopback traffic (both directions for local services)
+        iifname "lo" accept
+        oifname "lo" accept
+        
+        # Allow established/related connections first
+        ct state {established, related} accept
+        
+        # Allow Psiphon user (UID $psiphon_uid) to use any interface (needed for tunnel establishment)
+        # This must come before TUN-only rule to allow tunnel bootstrap
+        meta skuid $psiphon_uid accept
+        
+        # Allow TUN interface traffic for everyone else
+        oifname "$tun_interface" accept
+        
+        # Everyone else can ONLY use TUN interface (default DROP policy handles blocking)
+    }
+}
+
+# IPv4 NAT table
+table ip psiphon_nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        
+        # NAT for IPv4 traffic from TUN subnet going out through bypass interface
+        ip saddr $tun_subnet oifname "$bypass_interface" masquerade
+    }
+}
+
+# IPv6 NAT table
+table ip6 psiphon_nat6 {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        
+        # NAT for IPv6 traffic from TUN subnet going out through bypass interface
+        ip6 saddr $tun_subnet6 oifname "$bypass_interface" masquerade
+    }
+}
+EOF
+    
+    # Validate the ruleset before applying (show errors for debugging)
+    local validation_output
+    if ! validation_output=$(nft -c -f "$nft_ruleset_file" 2>&1); then
+        error "nftables ruleset validation failed. Generated ruleset is invalid."
+        error "Validation error details:"
+        echo "$validation_output" | while read -r line; do
+            error "  $line"
+        done
+        # Also log the generated ruleset for debugging
+        error "Generated ruleset that failed validation:"
+        while read -r line; do
+            error "  $line"
+        done < "$nft_ruleset_file"
+        return 1
+    fi
+    
+    log "nftables ruleset validation passed"
+    
+    # Apply the validated ruleset
+    local apply_error
+    local apply_status
+    apply_error=$(nft -f "$nft_ruleset_file" 2>&1)
+    apply_status=$?
+    
+    if [ $apply_status -ne 0 ]; then
+        error "Failed to apply nftables rules (exit code: $apply_status)"
+        error "Application error details:"
+        echo "$apply_error" | while read -r line; do
+            error "  $line"
+        done
+        error "Generated ruleset that failed application:"
+        while read -r line; do
+            error "  $line"
+        done < "$nft_ruleset_file"
+        return 1
+    fi
+    
+    if [ -n "$apply_error" ]; then
+        log "nftables applied with warnings/output: $apply_error"
+    fi
+    
+    # Verify the rules were actually applied
+    
+    log "Verifying nftables rules were applied successfully..."
+    
+    # First check if nft command exists
+    if ! command -v nft >/dev/null 2>&1; then
+        error "nft command not found - nftables may not be installed"
+        return 1
+    fi
+    
+    # Check if the table exists
+    local table_check
+    if ! table_check=$(nft list tables inet 2>&1); then
+        error "Failed to list nftables tables"
+        error "  Error: $table_check"
+        return 1
+    fi
+    
+    if ! nft list chain inet psiphon_filter output >/dev/null 2>&1; then
+        error "nftables rules were not properly applied - OUTPUT chain not found"
+        error "Available tables:"
+        nft list tables 2>&1 | while read -r line; do
+            error "  $line"
+        done
+        error "Attempting to list all rules for debugging:"
+        nft list ruleset 2>&1 | while read -r line; do
+            error "  $line"
+        done
+        return 1
+    fi
+    
+    log "✓ nftables rules successfully applied and verified"
+    
+    # Save nftables rules for persistence
+    log "Saving nftables configuration for persistence..."
+    
+    # Create /etc/nftables directory if it doesn't exist
+    mkdir -p "/etc/nftables" 2>/dev/null || true
+    
+    # Save the validated ruleset for persistence
+    # Use the temporary file we already validated
+    if ! cp "$nft_ruleset_file" "/etc/nftables/psiphon-tun.nft" 2>/dev/null; then
+        warning "Failed to save nftables ruleset to /etc/nftables/psiphon-tun.nft (persistence may not work across reboots)"
+    else
+        log "nftables ruleset saved to /etc/nftables/psiphon-tun.nft"
+    fi
+    
+    # Ensure the main config file includes our ruleset
+    if [ -f "/etc/nftables.conf" ]; then
+        # Remove any old psiphon includes first to avoid duplicates
+        sed -i '/psiphon-tun/d' "/etc/nftables.conf" 2>/dev/null || true
+        # Add our include if not present
+        if ! grep -q 'psiphon-tun.nft' "/etc/nftables.conf" 2>/dev/null; then
+            if echo 'include "/etc/nftables/psiphon-tun.nft"' >> "/etc/nftables.conf" 2>/dev/null; then
+                log "Added psiphon-tun.nft include to /etc/nftables.conf"
+            fi
+        fi
+    else
+        # If main config doesn't exist, create a new one with our rules
+        if cat > "/etc/nftables.conf" << 'NFTCONF' 2>/dev/null
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+include "/etc/nftables/psiphon-tun.nft"
+NFTCONF
+        then
+            log "Created /etc/nftables.conf with psiphon-tun.nft include"
+        else
+            warning "Failed to create /etc/nftables.conf (system may not auto-load rules on reboot)"
+        fi
+    fi
+    
+    # Ensure nftables service is enabled and running
+    # Ensure nftables service is enabled and running
+    if ! systemctl is-enabled nftables &>/dev/null 2>&1; then
+        if systemctl enable nftables 2>/dev/null; then
+            log "Enabled nftables service"
+        else
+            warning "Failed to enable nftables service (manual enabling may be required)"
+        fi
+    fi
+    
+    # IMPORTANT: Do NOT restart nftables service during Psiphon operation!
+    # The nftables service runs 'flush ruleset' which would clear our in-memory rules.
+    # Since we've already applied rules via 'nft -f', they're active in-memory.
+    # Persistence is configured via /etc/nftables.conf includes, and will reload on system reboot.
+    # Restarting the service would clear everything, breaking the kill switch!
+    log "✓ nftables rules loaded and verified (NOT restarting service to preserve in-memory rules)"
+    
+    return 0
+}
+
 function setup_routing() {
     log "Setting up routing and firewall rules..."
-
 
     # === WARP Integration Check === (WARP is optional)
     if is_warp_connected; then
@@ -685,210 +1014,87 @@ function setup_routing() {
         log "May not work very well for now"
     fi
 
-    # === IPv4 Security Configuration ===
+    # === Base Security Configuration ===
     # Enable controlled forwarding for tunnel operations
     # Required for proper VPN functionality while maintaining security
     echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+    echo 1 > /proc/sys/net/ipv6/conf/default/forwarding
 
     # Add to sysctl.conf for persistence
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+        {
+            echo "net.ipv4.ip_forward=1"
+            echo "net.ipv6.conf.all.forwarding=1"
+            echo "net.ipv6.conf.default.forwarding=1"
+        } >> /etc/sysctl.conf
         sysctl -p >/dev/null 2>&1 || true
     fi
 
-    # Setup iptables rules for TUN interface
-    if ! iptables -F 2>&1; then
-        warning "Failed to flush IPv4 rules: $?"
+    # === Firewall Manager Compatibility ===
+    # Stop firewalld if running to prevent interference with nftables rules
+    # firewalld manages its own nftables tables and will clear our rules on reload
+    log "Checking for firewall managers that might interfere..."
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        log "firewalld is active - stopping to prevent nftables rule conflicts"
+        if systemctl stop firewalld 2>/dev/null; then
+            log "✓ firewalld stopped (we'll manage firewall rules directly via nftables)"
+        else
+            warning "Could not stop firewalld (may have permission issues)"
+        fi
     fi
-    if ! iptables -t nat -F 2>&1; then
-        warning "Failed to flush IPv4 NAT rules: $?"
-    fi
-    # Show current tables for debugging
-    log "Current IPv4 iptables rules:"
-    iptables -L -v -n
 
-    # Kill Switch: Block all traffic that is not going through the TUN interface
-    log "Implementing IPv4 kill switch..."
-    # Set default policy to DROP for output.
-    if ! iptables -P OUTPUT DROP 2>&1; then
-        error "Failed to set IPv4 OUTPUT policy to DROP"
+    # Create initial nftables ruleset
+    log "Setting up nftables ruleset..."
+
+    # Configure nftables rules
+    if ! configure_nftables; then
+        error "Failed to set up nftables rules"
         cleanup_routing
         return 1
     fi
 
-    # # Allow established and related connections to prevent breaking existing sessions.
-    # iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-    # Allow loopback traffic for local services.
-    iptables -A OUTPUT -o lo -j ACCEPT
-
-    # # Allow traffic to local private networks.
-    # iptables -A OUTPUT -d 10.0.0.0/8 -j ACCEPT
-    # iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT
-    # iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT
-
-    # Allow traffic for the psiphon user to establish the tunnel
-    # and ensure it can access network resources
-    iptables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
-
-    # TODO: iptables --cmd-owner and --pid-owner are not supported on most of the systems
-    #       so we can't use them for now
-    #
-    # if is_warp_connected && [[ -n "$WARP_INTERFACE" ]]; then
-    #     # Route psiphon-user traffic through WARP interface for chained VPN
-    #     log "Configuring psiphon-user to route through WARP interface"
-    #     iptables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -o "$warp_interface" -j ACCEPT
-    # else
-    #     # Standard direct routing for psiphon-user
-    #     iptables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
-    # fi
-    #
-    # # Allow WARP service to connect if WARP is connected
-    # if is_warp_connected; then
-    #     local warp_pid
-    #     if warp_pid=$(get_warp_svc_pid); then
-    #         log "WARP detected - allowing warp-svc process (PID: $warp_pid) to access internet"
-    #         # Use PID-based rule only (warp-svc runs as root, so can't use UID-based fallback)
-    #         if iptables -A OUTPUT -m owner --pid-owner "$warp_pid" -j ACCEPT 2>/dev/null; then
-    #             log "WARP allowed via PID-based rule"
-    #         else
-    #             warning "Failed to create WARP firewall rule - PID-based rules not supported"
-    #         fi
-    #     else
-    #         warning "WARP status is Connected but warp-svc process not found"
-    #     fi
-    # else
-    #     log "WARP not available - maintaining strict kill switch"
-    # fi
-
-    # Allow all traffic going through the TUN interface.
-    iptables -A OUTPUT -o "$TUN_INTERFACE" -j ACCEPT
-
-    # # Allow established connections
-    # iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-
-    # Setup iptables rules for TUN interface
-    # Allow traffic from TUN interface
-    iptables -A FORWARD -i "$TUN_INTERFACE" -j ACCEPT 2>/dev/null || true
-    iptables -A FORWARD -o "$TUN_INTERFACE" -j ACCEPT 2>/dev/null || true
-
-    # NAT traffic from TUN interface
-    iptables -t nat -A POSTROUTING -s "$TUN_SUBNET" -o "$TUN_BYPASS_INTERFACE" -j MASQUERADE 2>/dev/null || true
-
-    # # Redirect DNS traffic to force it through the tunnel, excluding psiphon-user
-    # log "Redirecting DNS traffic through TUN..."
-    # local DNS_SERVER_IP
-    # DNS_SERVER_IP=$(echo "$TUN_DNS_SERVERS" | cut -d',' -f1)
-    # iptables -t nat -A OUTPUT -p udp --dport 53 -m owner ! --uid-owner "$PSIPHON_USER" -j DNAT --to-destination "$DNS_SERVER_IP"
-    # iptables -t nat -A OUTPUT -p tcp --dport 53 -m owner ! --uid-owner "$PSIPHON_USER" -j DNAT --to-destination "$DNS_SERVER_IP"
-
-    # === IPv6 setup ===
-    setup_ipv6_routing
-
-    success "IPv4 and IPv6 Routing configured"
+    success "IPv4 and IPv6 routing configured with nftables"
 }
 
 # setting up IPv6 routing
 function setup_ipv6_routing() {
-    log "Setting up IPv6 routing..."
+    log "Setting up IPv6 system configuration..."
 
-    # Enable IPv6 forwarding
+    # Enable IPv6 forwarding (already done in setup_routing, but being explicit here)
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
     echo 1 > /proc/sys/net/ipv6/conf/default/forwarding
 
     # Ensure IPv6 is enabled on the TUN interface
     echo 0 > /proc/sys/net/ipv6/conf/"$TUN_INTERFACE"/disable_ipv6
 
-    # # Lower the IPv6 route preference for all other interfaces
-    # for interface in /proc/sys/net/ipv6/conf/*; do
-    #     if [[ "$(basename "$interface")" != "$TUN_INTERFACE" && "$(basename "$interface")" != "all" && "$(basename "$interface")" != "default" ]]; then
-    #         echo 100 > "$interface/route_pref" 2>/dev/null || true
-    #     fi
-    # done
+    # Enable IPv6 privacy extensions
+    echo 2 > /proc/sys/net/ipv6/conf/all/use_tempaddr
+    echo 2 > /proc/sys/net/ipv6/conf/default/use_tempaddr
 
-    # Add to sysctl.conf for persistence
-    if ! grep -q "net.ipv6.conf.all.forwarding=1" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
-        echo "net.ipv6.conf.default.forwarding=1" >> /etc/sysctl.conf
-        sysctl -p >/dev/null 2>&1 || true
-    fi
+    # Disable IPv6 autoconfiguration on TUN interface
+    echo 0 > /proc/sys/net/ipv6/conf/"$TUN_INTERFACE"/accept_ra
+    echo 0 > /proc/sys/net/ipv6/conf/"$TUN_INTERFACE"/autoconf
 
-    # Setup ip6tables rules for TUN interface
-    ip6tables -F 2>/dev/null || true
-    ip6tables -t nat -F 2>/dev/null || true
+    # Add persistent sysctl settings
+    cat > /etc/sysctl.d/99-psiphon-ipv6.conf << EOF
+# IPv6 forwarding
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
 
-    # Kill Switch: Block all IPv6 traffic that is not going through the TUN interface
-    log "Implementing IPv6 kill switch..."
-    # Set default policy to DROP for output.
-    if ! ip6tables -P OUTPUT DROP 2>&1; then
-        error "Failed to set IPv6 OUTPUT policy to DROP"
-        cleanup_routing
-        return 1
-    fi
+# Privacy extensions
+net.ipv6.conf.all.use_tempaddr=2
+net.ipv6.conf.default.use_tempaddr=2
 
-    # # Allow established and related connections.
-    # ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+# Disable autoconfiguration on TUN
+net.ipv6.conf.$TUN_INTERFACE.accept_ra=0
+net.ipv6.conf.$TUN_INTERFACE.autoconf=0
+EOF
 
-    # Allow loopback traffic.
-    ip6tables -A OUTPUT -o lo -j ACCEPT
+    # Apply sysctl settings
+    sysctl --system >/dev/null 2>&1 || true
 
-    # # Allow link-local addresses for local network discovery.
-    # ip6tables -A OUTPUT -d fe80::/10 -j ACCEPT
-
-    # Allow traffic for the psiphon user to establish the tunnel
-    # and ensure it can access network resources
-    ip6tables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
-
-    # TODO: iptables --cmd-owner and --pid-owner are not supported on most of the systems
-    #       so we can't use them for now
-    #
-    # if is_warp_connected && [[ -n "$WARP_INTERFACE" ]]; then
-    #     # Route psiphon-user IPv6 traffic through WARP interface for chained VPN
-    #     log "Configuring psiphon-user IPv6 to route through WARP interface"
-    #     ip6tables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -o "$WARP_INTERFACE" -j ACCEPT
-    # else
-    #     # Standard direct routing for psiphon-user IPv6
-    #     ip6tables -A OUTPUT -m owner --uid-owner "$PSIPHON_USER" -j ACCEPT
-    # fi
-    #
-    # # Allow WARP service to connect if WARP is connected (IPv6)
-    # if is_warp_connected; then
-    #     local warp_pid
-    #     if warp_pid=$(get_warp_svc_pid); then
-    #         log "WARP detected - allowing warp-svc process (PID: $warp_pid) to access internet (IPv6)"
-    #         # Use PID-based rule only (warp-svc runs as root, so can't use UID-based fallback)
-    #         if ip6tables -A OUTPUT -m owner --pid-owner "$warp_pid" -j ACCEPT 2>/dev/null; then
-    #             log "WARP IPv6 allowed via PID-based rule"
-    #         else
-    #             warning "Failed to create WARP IPv6 firewall rule - PID-based rules not supported"
-    #         fi
-    #     else
-    #         warning "WARP status is Connected but warp-svc process not found"
-    #     fi
-    # else
-    #     log "WARP not available - maintaining strict IPv6 kill switch"
-    # fi
-
-    # Allow all traffic going through the TUN interface.
-    ip6tables -A OUTPUT -o "$TUN_INTERFACE" -j ACCEPT
-
-    # # Allow established connections
-    # ip6tables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-
-    # Setup ip6tables rules for TUN interface
-    ip6tables -A FORWARD -i "$TUN_INTERFACE" -j ACCEPT 2>/dev/null || true
-    ip6tables -A FORWARD -o "$TUN_INTERFACE" -j ACCEPT 2>/dev/null || true
-
-    # NAT IPv6 traffic from TUN interface
-    ip6tables -t nat -A POSTROUTING -s "$TUN_SUBNET6" -o "$TUN_BYPASS_INTERFACE" -j MASQUERADE 2>/dev/null || true
-
-    # # Redirect IPv6 DNS traffic
-    # local DNS_SERVER_IP6
-    # DNS_SERVER_IP6=$(echo "$TUN_DNS_SERVERS6" | cut -d',' -f1)
-    # ip6tables -t nat -A OUTPUT -p udp --dport 53 -m owner ! --uid-owner "$PSIPHON_USER" -j DNAT --to-destination "$DNS_SERVER_IP6"
-    # ip6tables -t nat -A OUTPUT -p tcp --dport 53 -m owner ! --uid-owner "$PSIPHON_USER" -j DNAT --to-destination "$DNS_SERVER_IP6"
-
-    success "IPv6 routing configured"
+    success "IPv6 system configuration completed"
 }
 
 # Waits for IPv4 routing to stabilize
@@ -969,24 +1175,47 @@ function check_network_readiness() {
         log "✓ IPv6 default route configured"
     fi
 
-    # Check iptables kill switch is active
-    local ipv4_policy
-    ipv4_policy=$(iptables -S | grep "^-P OUTPUT" | awk '{print $3}')
-    if [[ "$ipv4_policy" != "DROP" ]]; then
-        error "IPv4 kill switch (OUTPUT DROP policy) not active (current: ${ipv4_policy:-ACCEPT})"
-        issues=$((issues + 1))
+    # Check nftables kill switch is active
+    local nft_output
+    if nft_output=$(nft list chain inet psiphon_filter output 2>&1) && echo "$nft_output" | grep -q 'policy drop'; then
+        log "✓ nftables kill switch active (OUTPUT DROP policy)"
     else
-        log "✓ IPv4 kill switch active"
+        error "nftables kill switch (OUTPUT DROP policy) not active"
+        # Provide diagnostic info
+        if ! command -v nft >/dev/null 2>&1; then
+            error "  Diagnostic: nft command not available"
+        elif [ -z "$nft_output" ]; then
+            error "  Diagnostic: psiphon_filter table or output chain not found"
+            log "  Available nftables tables:"
+            nft list tables 2>&1 | sed 's/^/    /'
+        else
+            error "  Diagnostic: OUTPUT chain found but missing DROP policy"
+            error "  Chain contents:"
+            echo "$nft_output" | awk '{print "    " $0}'
+        fi
+        issues=$((issues + 1))
     fi
 
-    # Check ip6tables kill switch is active
-    local ipv6_policy
-    ipv6_policy=$(ip6tables -S | grep "^-P OUTPUT" | awk '{print $3}')
-    if [[ "$ipv6_policy" != "DROP" ]]; then
-        error "IPv6 kill switch (OUTPUT DROP policy) not active (current: ${ipv6_policy:-ACCEPT})"
-        issues=$((issues + 1))
+    # Verify nftables rules for psiphon-user (check for meta skuid rule)
+    if [ -n "$nft_output" ] && echo "$nft_output" | grep -qE 'meta skuid [0-9]+'; then
+        log "✓ nftables psiphon-user rules active"
     else
-        log "✓ IPv6 kill switch active"
+        warning "nftables psiphon-user rules may not be properly configured"
+        # Don't count as fatal since connection might still work
+    fi
+
+    # Verify TUN interface rules exist
+    if [ -n "$nft_output" ] && echo "$nft_output" | grep -qE "oifname \"$TUN_INTERFACE\""; then
+        log "✓ nftables TUN interface rules active"
+    else
+        error "nftables TUN interface rules not found"
+        if [ -n "$nft_output" ]; then
+            error "  Diagnostic: OUTPUT chain found but missing TUN interface rules"
+            error "  Looking for: oifname \"$TUN_INTERFACE\""
+            error "  Actual chain contents:"
+            echo "$nft_output" | awk '{print "    " $0}'
+        fi
+        issues=$((issues + 1))
     fi
 
     log "✓ Network configuration complete"
@@ -1040,11 +1269,29 @@ function diagnose_network_issues() {
     # Firewall status
     log ""
     log "3. Firewall Status:"
-    log "IPv4 iptables OUTPUT policy:"
-    iptables-save
+    log "nftables ruleset:"
+    nft list ruleset 2>/dev/null || log "   Error: nftables not available or no rules set"
 
-    log "IPv6 ip6tables OUTPUT policy:"
-    ip6tables-save
+    # Check specific security rules
+    log ""
+    log "Key security rules:"
+    if nft list chain inet psiphon_filter output 2>/dev/null | grep -q 'policy drop'; then
+        log "✓ OUTPUT chain policy: DROP (Kill switch active)"
+    else
+        log "✗ OUTPUT chain policy not set to DROP"
+    fi
+    
+    if nft list chain inet psiphon_filter output 2>/dev/null | grep -qE 'meta skuid [0-9]+'; then
+        log "✓ psiphon-user rules active"
+    else
+        log "✗ psiphon-user rules missing or not properly configured"
+    fi
+
+    if nft list chain inet psiphon_filter output 2>/dev/null | grep -qE "oifname \"$TUN_INTERFACE\""; then
+        log "✓ TUN interface rules active (oifname $TUN_INTERFACE)"
+    else
+        log "✗ TUN interface rules missing"
+    fi
 
     # Process status
     log ""
@@ -1124,49 +1371,73 @@ function diagnose_network_issues() {
     success "Network diagnostic complete - review output above for issues"
 }
 
+# This waits for the kernel to fully process the manual IPv6 configuration,
+# not for any actual Router Advertisements
 function wait_for_ra_processing() {
-    log "Waiting for Router Advertisement processing..."
+    log "Waiting for TUN interface to reach stable IPv6 state..."
 
     local timeout=15
-    local count=0
+    local elapsed=0
+    local stable_count=0
+    local required_stable_cycles=3
+    local prev_addr_state=""
 
-    # Wait for any IPv6 changes to settle
-    # This includes both native network RA and tunnel RA
-    while [ $count -lt $timeout ]; do
-        local current_routes
-        current_routes=$(ip -6 route show 2>/dev/null | md5sum)
+    # Wait for TUN interface IPv6 addresses and routes to stabilize
+    # This is more robust than monitoring all routes - we only care about TUN
+    while [ $elapsed -lt $timeout ]; do
+        # Check TUN interface actual state (addresses and routes together)
+        local current_state
+        current_state=$(ip -6 addr show "$TUN_INTERFACE" 2>/dev/null | md5sum || echo "")
+        current_state+=$(ip -6 route show dev "$TUN_INTERFACE" 2>/dev/null | md5sum || echo "")
 
-        # Wait a bit
-        sleep 1
-        count=$((count + 1))
+        if [ -z "$prev_addr_state" ]; then
+            # First iteration - just record the snapshot
+            prev_addr_state="$current_state"
+            log "TUN interface IPv6 state monitoring started... ($elapsed/$timeout)"
+        elif [ "$current_state" = "$prev_addr_state" ]; then
+            # State unchanged from last check
+            stable_count=$((stable_count + 1))
+            log "TUN IPv6 state stable ($stable_count/$required_stable_cycles)... ($elapsed/$timeout)"
 
-        # Check if routes have stabilized
-        local new_routes
-        new_routes=$(ip -6 route show 2>/dev/null | md5sum)
-
-        if [ "$current_routes" = "$new_routes" ]; then
-            # Routes stable for 2 seconds
-            log "IPv6 routes stabilized"
-            break
+            # If we've seen stable state for required_stable_cycles, we're done
+            if [ $stable_count -ge $required_stable_cycles ]; then
+                log "TUN interface IPv6 configuration stabilized after $elapsed seconds"
+                break
+            fi
         else
-            log "IPv6 routes still changing, waiting... ($count/$timeout)"
+            # State changed - reset stability counter
+            stable_count=0
+            log "TUN IPv6 state changed, reset counter... ($elapsed/$timeout)"
+            prev_addr_state="$current_state"
         fi
+
+        # Wait before next check
+        sleep 1
+        elapsed=$((elapsed + 1))
     done
 
-    if [ $count -ge $timeout ]; then
-        warning "IPv6 route changes didn't stabilize within $timeout seconds, proceeding"
+    if [ $elapsed -ge $timeout ]; then
+        warning "TUN IPv6 state didn't stabilize within $timeout seconds, proceeding anyway"
     fi
 
-    # Log final IPv6 state
-    log "Final IPv6 route state:"
-    ip -6 route show
+    # Log final TUN IPv6 state
+    log "Final TUN IPv6 state:"
+    ip -6 addr show "$TUN_INTERFACE" 2>/dev/null || true
+    ip -6 route show dev "$TUN_INTERFACE" 2>/dev/null || true
 
-    success "RA processing wait completed"
+    success "IPv6 TUN is stable now (waited $elapsed seconds)"
 }
 
 function setup_tun_routes_after_ra() {
     log "Setting up TUN default routes after Psiphon connection established..."
     log "This prevents self-routing by adding routes only after Psiphon binds to bypass interface"
+
+    # Explicit connection verification
+    # setup_tun_routes_after_ra() is called after start_services() returns, but
+    # Psiphon may not yet be fully connected. The wait_for_psiphon_connection() function
+    # called inside start_psiphon() ensures connection before we add default routes.
+    # However, we verify again here to be explicit about the dependency and catch any edge cases.
+    log "Verifying Psiphon connection before route setup..."
 
     # Verify Psiphon is actually connected before setting up routes
     local connection_verified="false"
@@ -1185,6 +1456,12 @@ function setup_tun_routes_after_ra() {
     if [[ "$connection_verified" != "true" ]]; then
         error "Psiphon connection not verified - refusing to set up default routes"
         error "This prevents potential self-routing issues"
+        error "Psiphon process may still be connecting. Check logs:"
+        if [[ "$SERVICE_MODE" == "true" ]]; then
+            error "  journalctl -u $SERVICE_BINARY_NAME.service -f"
+        else
+            error "  tail -f $PSIPHON_LOG_FILE"
+        fi
         return 1
     fi
 
@@ -1306,8 +1583,10 @@ function systemd_psiphon_reload() {
 # Returns 0 on success, 1 on timeout/failure
 function wait_for_psiphon_connection() {
     local timeout=$1
+    local initial_timeout=$timeout
+    
     log "Waiting for Psiphon to connect (timeout: ${timeout}s)..."
-
+    sleep 2  # Initial wait before checking logs
     while [ "$timeout" -gt 1 ]; do
         if [[ "$SERVICE_MODE" == "true" ]]; then
             # Service mode: check systemctl status and journalctl logs
@@ -1316,16 +1595,32 @@ function wait_for_psiphon_connection() {
                 return 1
             fi
 
-            # Check for connection in service logs
-            if journalctl -u $SERVICE_BINARY_NAME.service -n 20 --no-pager 2>/dev/null | grep -q "ConnectedServerRegion"; then
-                log "Psiphon connected successfully"
+            # Check for connection in service logs - only recent entries
+            # Use since to ensure we only check logs from after we started waiting
+            if journalctl -u $SERVICE_BINARY_NAME.service --since "1 minute ago" --no-pager 2>/dev/null | grep -q "ConnectedServerRegion"; then
+                echo ""
+                success "Psiphon connected successfully"
                 return 0
             fi
         else
-            # Script mode: check log file
-            if [[ -f "$PSIPHON_LOG_FILE" ]] && tail -n 5 "$PSIPHON_LOG_FILE" 2>/dev/null | grep -q "ConnectedServerRegion"; then
-                log "Psiphon connected successfully"
-                return 0
+            # Script mode: check log file for NEW entries
+            if [[ -f "$PSIPHON_LOG_FILE" ]]; then
+                # Get only new lines from the log file
+                local current_content
+                current_content=$(tail -n 5 "$PSIPHON_LOG_FILE" 2>/dev/null)
+                
+                # Check if we found the connection marker in recent logs
+                if echo "$current_content" | grep -q "ConnectedServerRegion"; then
+                    echo ""
+                    success "Psiphon connected successfully"
+                    return 0
+                fi
+                
+                # Also check if the log file is growing (process is active)
+                if ! echo "$current_content" | grep -q "Error\|error\|FATAL\|fatal"; then
+                    # No errors detected yet, keep waiting
+                    :
+                fi
             fi
         fi
 
@@ -1335,7 +1630,7 @@ function wait_for_psiphon_connection() {
     done
 
     echo ""
-    error "Timeout waiting for Psiphon connection after ${timeout} seconds"
+    error "Timeout waiting for Psiphon connection after $((initial_timeout - timeout)) seconds"
     return 1
 }
 
@@ -1438,9 +1733,32 @@ function start_psiphon() {
             return 1
         fi
 
-        echo "$psiphon_pid" | tee $PID_FILE >/dev/null
-        chown root:root $PID_FILE
-        chmod 644 $PID_FILE
+        # Write PID file atomically to prevent race conditions
+        # Use temp file with restrictive permissions, then atomic rename
+        local pid_temp_file="${PID_FILE}.tmp.$$"
+        {
+            echo "$psiphon_pid"
+        } > "$pid_temp_file" || {
+            error "Failed to write temporary PID file"
+            kill -TERM "$psiphon_pid" 2>/dev/null || true
+            return 1
+        }
+        # Set restrictive permissions before moving to final location
+        chmod 600 "$pid_temp_file"
+        chown root:root "$pid_temp_file"
+        # Atomic rename prevents reading partial/corrupted PID file
+        mv -f "$pid_temp_file" "$PID_FILE" || {
+            error "Failed to move PID file to final location"
+            rm -f "$pid_temp_file"
+            kill -TERM "$psiphon_pid" 2>/dev/null || true
+            return 1
+        }
+        # After successful atomic write, verify readability
+        if [[ ! -r "$PID_FILE" ]]; then
+            error "PID file not readable after creation"
+            return 1
+        fi
+        chmod 644 $PID_FILE  # Relax permissions only after atomic write succeeds
 
         # Test if connection is actually working
         log "Verifying tunnel connectivity..."
@@ -1572,22 +1890,78 @@ function start_services() {
 function cleanup_routing() {
     log "Cleaning up routing and firewall rules..."
 
-    # Disable kill switch: Reset default policies to ACCEPT and flush all firewall rules
-    log "Disabling firewall kill switch..."
-    iptables -P OUTPUT ACCEPT 2>/dev/null || true
-    iptables -P FORWARD ACCEPT 2>/dev/null || true
-    iptables -F 2>/dev/null || true
-    iptables -t nat -F 2>/dev/null || true
+    # Reset nftables by only removing Psiphon-specific tables, preserving any unrelated nftables
+    log "Removing Psiphon-specific nftables rules..."
+    
+    # Create a temporary cleanup script that only removes our tables
+    local cleanup_script_file
+    cleanup_script_file=$(mktemp) || {
+        error "Failed to create temporary file for nftables cleanup script"
+        return 1
+    }
 
-    ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
-    ip6tables -P FORWARD ACCEPT 2>/dev/null || true
-    ip6tables -F 2>/dev/null || true
-    ip6tables -t nat -F 2>/dev/null || true
+    # shellcheck disable=SC2064
+    # Double quotes intentionally used here to capture the local variable value
+    # while the function is still executing. Single quotes would cause the
+    # variable to be undefined when the trap fires (out of scope).
+    trap "rm -f '$cleanup_script_file'" RETURN
+    
+    # Only remove Psiphon-specific tables, leaving all other nftables intact
+    cat > "$cleanup_script_file" << 'EOF'
+# Remove only Psiphon-specific tables, preserve all other rules
+delete table inet psiphon_filter
+delete table ip psiphon_nat
+delete table ip6 psiphon_nat6
+EOF
+    
+    # Apply the cleanup script to remove only our tables
+    if ! nft -f "$cleanup_script_file" 2>/dev/null; then
+        # If nftables is not available or fails, log warning but continue with cleanup
+        warning "Failed to remove Psiphon nftables rules (nftables may not be available or rules not loaded)"
+    fi
 
-    # The default routes are removed when the TUN interface is deleted, but we can be explicit.
+    # The default routes are removed when the TUN interface is deleted, but we can be explicit
     ip route del default via "$TUN_PEER_IP" dev "$TUN_INTERFACE" 2>/dev/null || true
     ip route del default dev "$TUN_INTERFACE" 2>/dev/null || true
     ip -6 route del default dev "$TUN_INTERFACE" 2>/dev/null || true
+
+    # Remove our custom nftables configuration if it exists
+    # Do this AFTER resetting rules to ensure we can safely remove files
+    if [ -f "/etc/nftables/psiphon-tun.nft" ]; then
+        if rm -f "/etc/nftables/psiphon-tun.nft" 2>/dev/null; then
+            log "Removed /etc/nftables/psiphon-tun.nft"
+        else
+            warning "Failed to remove /etc/nftables/psiphon-tun.nft (may require manual cleanup)"
+        fi
+    fi
+    
+    # Clean up include line from main nftables config
+    if [ -f "/etc/nftables.conf" ]; then
+        if sed -i '/psiphon-tun\.nft/d' "/etc/nftables.conf" 2>/dev/null; then
+            log "Removed psiphon-tun.nft include from /etc/nftables.conf"
+        else
+            warning "Failed to remove include from /etc/nftables.conf (manual editing may be required)"
+        fi
+    fi
+
+    # Reload nftables service to apply changes if it's running
+    if systemctl is-active nftables &>/dev/null 2>&1; then
+        if systemctl restart nftables 2>/dev/null; then
+            log "Restarted nftables service with cleaned configuration"
+        else
+            warning "Failed to restart nftables service (changes may not apply until manual restart)"
+        fi
+    fi
+
+    # Restart firewalld if it was stopped by us (restores system firewall management)
+    if systemctl is-enabled firewalld &>/dev/null 2>&1; then
+        log "Restarting firewalld to restore system firewall management..."
+        if systemctl start firewalld 2>/dev/null; then
+            log "✓ firewalld restarted successfully"
+        else
+            warning "Could not restart firewalld (manual restart may be needed)"
+        fi
+    fi
 
     success "Routing and firewall rules cleaned up."
 }
@@ -1833,12 +2207,8 @@ function warp_status() {
                 # Check firewall rules for WARP
                 echo ""
                 echo "=== Firewall Configuration ==="
-                echo "IPv4 rules for WARP process (PID: $warp_pid):"
-                iptables -L OUTPUT -v -n | grep "$warp_pid" || echo "No PID-specific rules found"
-
-                echo ""
-                echo "IPv6 rules for WARP process (PID: $warp_pid):"
-                ip6tables -L OUTPUT -v -n | grep "$warp_pid" || echo "No PID-specific rules found"
+                echo "Firewall rules for WARP process (PID: $warp_pid):"
+                nft list ruleset | grep -i "meta skpid $warp_pid" || echo "No PID-specific rules found"
 
             else
                 echo -e "WARP Service: ${RED}Process Not Found${NC}"
