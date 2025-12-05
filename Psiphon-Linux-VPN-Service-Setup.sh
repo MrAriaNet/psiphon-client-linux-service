@@ -19,7 +19,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly INSTALLER_VERSION="1.4.0"
+readonly INSTALLER_VERSION="1.4.1"
 # Security and Configuration Parameters
 # These values are critical for the security model - DO NOT MODIFY without understanding implications
 readonly PSIPHON_USER="psiphon-user"     # Dedicated non-root user for process isolation
@@ -521,7 +521,7 @@ RestartSec=7s
 # Security settings
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=$INSTALL_DIR /var/log
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_RESOURCE
@@ -1597,7 +1597,7 @@ function wait_for_psiphon_connection() {
 
             # Check for connection in service logs - only recent entries
             # Use since to ensure we only check logs from after we started waiting
-            if journalctl -u $SERVICE_BINARY_NAME.service --since "1 minute ago" --no-pager 2>/dev/null | grep -q "ConnectedServerRegion"; then
+            if journalctl -u $SERVICE_BINARY_NAME.service --since "7 seconds ago" --no-pager 2>/dev/null | grep -q "ConnectedServerRegion"; then
                 echo ""
                 success "Psiphon connected successfully"
                 return 0
